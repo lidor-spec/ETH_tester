@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.log
+npcap-*.exe
+switch_test_*.html
+switch_test_*.csv
+switch_test_*.json

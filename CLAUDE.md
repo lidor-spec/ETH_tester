@@ -1,4 +1,4 @@
-# ETH Switch Tester — project context
+# ETH_USB_tester — project context
 
 Layer-2 Ethernet switch validation tool with a live Tkinter GUI. Single file,
 ~4200 lines, no dependencies beyond `scapy` + Npcap — plus **OpenCV, which is
@@ -6,7 +6,10 @@ optional and used only by the Camera Passthrough tab** (see below).
 
 ## What is being tested
 
-**DUT:** a custom board built around a **Microchip KSZ8895** — 5-port 10/100
+**Two DUTs, two benches.** The app opens on a landing screen: `Test ETH` or `Test USB`.
+See "Test USB" below for the hub bench; everything up to it is the Ethernet bench.
+
+**ETH DUT:** a custom board built around a **Microchip KSZ8895** — 5-port 10/100
 managed Ethernet switch. In this hardware revision **port 4 is 100BASE-FX
 fiber**; the rest are copper. Datasheet is in `~/Downloads`
 (`KSZ8895MQX-...-DS00002246B.pdf`). The board's Altium project is

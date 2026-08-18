@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(awk 'NR>0')",
+      "Bash(/c/Program Files/Python313/python.exe *)",
+      "PowerShell(Get-PnpDevice *)",
+      "Bash(cat)",
+      "Bash(\"/c/Program Files/Python313/python.exe\" \"/c/Users/lidor/AppData/Local/Temp/claude/C--Users-lidor-ETH-Switch-Tester/1b8628a2-6ee0-41b2-a49f-1445a469bc92/scratchpad/ppmtest.py\")",
+      "Bash(\"/c/Program Files/Python313/python.exe\" -m pip install --quiet opencv-python)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(\"/c/Program Files/Python313/python.exe\" -c \"import cv2,numpy;print\\('cv2',cv2.__version__,'numpy',numpy.__version__\\)\")"
+    ]
+  }
+}

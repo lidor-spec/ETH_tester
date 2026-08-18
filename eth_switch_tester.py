@@ -32,6 +32,7 @@
 from __future__ import annotations
 
 import csv
+import ctypes          # Win32 Raw Input for the USB test (section 4d); stdlib
 import html
 import json
 import os
@@ -87,6 +88,25 @@ VERSION = 1
 
 BROADCAST = "ff:ff:ff:ff:ff:ff"
 SNAPLEN = 128                   # capture only the header we actually parse
+
+# --- Camera passthrough channel (section 4c) ------------------------------
+# A SECOND, completely separate EtherType so the video demo can never be
+# mistaken for - or interfere with - the 0x88B5 measurement stream. 0x88B6 is
+# "IEEE Std 802 local experimental EtherType 2", the companion of 0x88B5.
+ETHERTYPE_VIDEO = 0x88B6
+VID_MAGIC = b"SWCV"                     # SWitch Camera Video
+VID_VERSION = 1
+VID_HDR_FMT = "!4sBBHHHHQ"      # magic, ver, flags, frame_id, chunk_idx,
+                                # chunk_count, payload_len, tx_ns
+VID_HDR_LEN = struct.calcsize(VID_HDR_FMT)              # 22
+# Largest JPEG slice that still fits a standard 1518 B frame. The KSZ8895 in
+# this board does not forward anything above 1518 B (see CLAUDE.md), so we must
+# not exceed it.
+VID_MAX_CHUNK = MAX_FRAME - FCS_LEN - ETH_HDR_LEN - VID_HDR_LEN      # 1478
+# Video needs the WHOLE frame, not just a header, so this channel uses its own
+# capture snaplen. The measurement path keeps SNAPLEN=128 (invariant: raising it
+# costs receive throughput).
+VID_SNAPLEN = 1600
 
 # Let the capture thread get the GIL back quickly from the transmit loop.
 try:
@@ -586,10 +606,14 @@ class Receiver:
                  raw_hook: Optional[Callable[[bytes, float], None]] = None,
                  expect_stream: Optional[int] = None,
                  parse_fn: Optional[Callable] = None,
-                 bpf_override: Optional[str] = None):
+                 bpf_override: Optional[str] = None,
+                 snaplen: int = SNAPLEN):
         if not SCAPY_OK:
             raise RuntimeError("scapy not available: " + SCAPY_ERR)
         self.iface = iface
+        # Bytes copied out of the kernel per frame. The measurement path only
+        # needs the header (SNAPLEN); the camera channel needs the whole frame.
+        self.snaplen = int(snaplen)
         self.stats_by_stream = stats_by_stream
         self.raw_hook = raw_hook
         # A capture handle on the TX adapter also sees our own outbound
@@ -656,7 +680,7 @@ class Receiver:
         try:
             # Small snaplen: we only need the header, and copying 128 B per
             # frame instead of 1518 B keeps the reader ahead of the wire.
-            p = open_pcap(self.iface, SNAPLEN, True, 1)
+            p = open_pcap(self.iface, self.snaplen, True, 1)
         except Exception:
             return False
         # Enlarge the kernel capture buffer (Npcap/WinPcap extension) and ask
@@ -674,7 +698,12 @@ class Receiver:
         except Exception:
             pass
         if not bpf_all:
-            for flt in (self._bpf(), "ether proto 0x88b5"):
+            # With an explicit override (reflection mode, camera channel) there
+            # is NO 0x88B5 fallback: silently swapping in the measurement filter
+            # would make those receivers deaf to the traffic they exist for.
+            cands = ([self._bpf()] if self.bpf_override
+                     else [self._bpf(), "ether proto 0x88b5"])
+            for flt in cands:
                 try:
                     p.setfilter(flt)
                     self.filtered = True
@@ -794,7 +823,7 @@ class Receiver:
         # ---- fallback ----
         if not bpf_all:
             self.sniffer = self._try_start(self._bpf())
-            if self.sniffer is None:
+            if self.sniffer is None and not self.bpf_override:
                 self.sniffer = self._try_start("ether proto 0x88b5")
             self.filtered = self.sniffer is not None
         if self.sniffer is None:
@@ -1246,6 +1275,1295 @@ class ReflectSession:
         out["rtt_avg_us"] = out["lat_avg_us"]
         out["switch_us_estimate"] = out["lat_avg_us"] / 2.0
         return out
+
+
+# ==========================================================================
+# 4c. CAMERA PASSTHROUGH (visual proof the fabric forwards live video)
+# ==========================================================================
+#
+# Everything else in this tool produces numbers. This produces a PICTURE: the
+# PC's webcam is captured, JPEG-compressed, chopped into raw Ethernet frames,
+# pushed out adapter A, through the DUT, back in on adapter B, reassembled and
+# drawn on screen next to the local preview.
+#
+#     webcam -> JPEG -> [chunks, EtherType 0x88B6] -> A --switch-- B -> screen
+#
+# Straight A->B exercises two copper ports; cabling copper -> fiber -> media
+# converter -> copper sends the same video across the fabric twice and through
+# the 100BASE-FX SERDES, so a clean image is direct evidence the fiber path
+# carries real payload.
+#
+# This is QUALITATIVE. It is not a throughput or loss test: the offered load is
+# ~1-3 Mbps on a 100 Mbps link. The numbers it shows (frames intact / dropped)
+# exist so a corrupted display can be explained, not to grade the switch. The
+# 11-test suite remains the measurement of record.
+#
+# ---- Wire format ---------------------------------------------------------
+#
+#   Ethernet header (14 B)
+#     0  dst MAC (6)        - the RECEIVING adapter's MAC (unicast; the switch
+#                             learns it, so this also proves forwarding rather
+#                             than flooding)
+#     6  src MAC (6)        - the sending adapter's MAC
+#    12  EtherType (2)      - 0x88B6, NOT the 0x88B5 measurement type, so both
+#                             mechanisms can run without ever aliasing
+#   Chunk header (22 B, VID_HDR_FMT = "!4sBBHHHHQ")
+#    14  magic (4)          - b"SWCV"
+#    18  ver (1)            - VID_VERSION
+#    19  flags (1)          - reserved, 0
+#    20  frame_id (2)       - video frame counter, wraps at 65536
+#    22  chunk_idx (2)      - 0 .. chunk_count-1
+#    24  chunk_count (2)    - number of chunks in this video frame
+#    26  payload_len (2)    - REAL JPEG bytes in this frame; needed because a
+#                             short last chunk gets zero-padded to the 64 B
+#                             Ethernet minimum
+#    28  tx_ns (8)          - now_ns() at transmit, identical in every chunk of
+#                             one video frame, so RX can price the whole frame
+#   JPEG slice (payload_len B, up to VID_MAX_CHUNK = 1478)
+#
+# Untagged only - the demo channel deliberately avoids 802.1Q so it cannot trip
+# over the tag-offset trap that the measurement codec has to handle.
+
+
+def build_video_chunks(dst: str, src: str, frame_id: int, jpeg: bytes,
+                       tx_ns: int, max_chunk: int = VID_MAX_CHUNK) -> List[bytes]:
+    """
+    Slice one JPEG image into ready-to-inject Ethernet frames.
+
+    Every chunk carries the full header, so a receiver can reassemble without
+    having seen chunk 0 first and can tell immediately when a chunk is missing.
+    Short frames are zero-padded to the 64 B Ethernet minimum; payload_len says
+    how much of the tail is real data.
+    """
+    n = max(1, (len(jpeg) + max_chunk - 1) // max_chunk)
+    if n > 0xFFFF:
+        raise ValueError("image too large to chunk")
+    dst_b = mac_str_to_bytes(dst)
+    src_b = mac_str_to_bytes(src)
+    eth = dst_b + src_b + struct.pack("!H", ETHERTYPE_VIDEO)
+    out: List[bytes] = []
+    for i in range(n):
+        payload = jpeg[i * max_chunk:(i + 1) * max_chunk]
+        buf = bytearray(eth)
+        buf += struct.pack(VID_HDR_FMT, VID_MAGIC, VID_VERSION, 0,
+                           frame_id & 0xFFFF, i, n, len(payload), tx_ns)
+        buf += payload
+        if len(buf) < MIN_FRAME - FCS_LEN:
+            buf += bytes(MIN_FRAME - FCS_LEN - len(buf))
+        out.append(bytes(buf))
+    return out
+
+
+def parse_video_chunk(data: bytes):
+    """Return (frame_id, chunk_idx, chunk_count, payload, tx_ns) or None."""
+    if len(data) < ETH_HDR_LEN + VID_HDR_LEN:
+        return None
+    if data[12] != 0x88 or data[13] != 0xB6:
+        return None
+    if data[ETH_HDR_LEN:ETH_HDR_LEN + 4] != VID_MAGIC:
+        return None
+    _m, ver, _flags, fid, idx, cnt, plen, tx_ns = struct.unpack_from(
+        VID_HDR_FMT, data, ETH_HDR_LEN)
+    if ver != VID_VERSION or cnt == 0 or idx >= cnt:
+        return None
+    off = ETH_HDR_LEN + VID_HDR_LEN
+    if plen > len(data) - off:
+        return None                 # truncated capture (snaplen too small)
+    return fid, idx, cnt, data[off:off + plen], tx_ns
+
+
+def _fid_newer(a: int, b: int) -> bool:
+    """True if frame_id a is newer than b, honouring the 16-bit wrap."""
+    return (((a - b + 0x8000) & 0xFFFF) - 0x8000) > 0
+
+
+class VideoAssembler:
+    """
+    Reassembles JPEG frames from chunks. Pure logic, no I/O - the selftest
+    drives it directly.
+
+    Honesty rule, the visual twin of invariant 2 (never count in-flight frames
+    as lost): a frame with missing chunks is NOT declared incomplete while its
+    remaining chunks could still be on the wire. It is only written off once a
+    NEWER frame has fully arrived, or once the small pending window overflows.
+    An image is handed to the display only when every one of its chunks is
+    present, so a torn or grey-blocked picture can never appear and be mistaken
+    for switch corruption.
+    """
+
+    KEEP = 4        # video frames allowed in flight before the oldest is lost
+
+    def __init__(self):
+        self.pend: Dict[int, Dict] = {}
+        self.watermark: Optional[int] = None    # newest fid completed/written off
+        self.frames_complete = 0
+        self.frames_incomplete = 0
+        self.chunks_rx = 0
+        self.chunks_missing = 0
+        self.chunks_dup = 0
+        self.chunks_late = 0
+        self.bytes_rx = 0
+        self.foreign = 0
+
+    def reset(self) -> None:
+        self.__init__()
+
+    def add(self, data: bytes, rx_ns: int):
+        """Feed one captured frame. Returns (jpeg, tx_ns, rx_ns) when complete."""
+        p = parse_video_chunk(data)
+        if p is None:
+            self.foreign += 1
+            return None
+        fid, idx, cnt, payload, tx_ns = p
+        self.chunks_rx += 1
+        self.bytes_rx += len(payload)
+        e = self.pend.get(fid)
+        if e is None:
+            # A frame_id already finished or written off must not be reopened by
+            # a late/duplicate chunk - that would resurrect it as a "new" frame.
+            if self.watermark is not None and not _fid_newer(fid, self.watermark):
+                self.chunks_late += 1
+                return None
+            e = {"cnt": cnt, "chunks": {}, "tx_ns": tx_ns}
+            self.pend[fid] = e
+        if idx in e["chunks"]:
+            self.chunks_dup += 1
+        e["chunks"][idx] = payload
+        if len(e["chunks"]) >= e["cnt"]:
+            jpeg = b"".join(e["chunks"][i] for i in range(e["cnt"]))
+            del self.pend[fid]
+            self.frames_complete += 1
+            self._retire_older_than(fid)
+            return jpeg, e["tx_ns"], rx_ns
+        # Not complete yet. Only bound the memory - do NOT judge this frame.
+        while len(self.pend) > self.KEEP:
+            oldest = min(self.pend, key=lambda k: (0x10000 if _fid_newer(k, fid) else 0, k))
+            self._write_off(oldest)
+        return None
+
+    def _write_off(self, fid: int) -> None:
+        e = self.pend.pop(fid, None)
+        if e is None:
+            return
+        self.frames_incomplete += 1
+        self.chunks_missing += max(0, e["cnt"] - len(e["chunks"]))
+        if self.watermark is None or _fid_newer(fid, self.watermark):
+            self.watermark = fid
+
+    def _retire_older_than(self, fid: int) -> None:
+        for k in [k for k in self.pend if _fid_newer(fid, k)]:
+            self._write_off(k)
+        if self.watermark is None or _fid_newer(fid, self.watermark):
+            self.watermark = fid
+
+    def stats(self) -> Dict:
+        return {"frames_complete": self.frames_complete,
+                "frames_incomplete": self.frames_incomplete,
+                "chunks_rx": self.chunks_rx,
+                "chunks_missing": self.chunks_missing,
+                "chunks_dup": self.chunks_dup,
+                "chunks_late": self.chunks_late,
+                "bytes_rx": self.bytes_rx,
+                "pending": len(self.pend)}
+
+
+# ---- OpenCV: the one deliberate extra dependency --------------------------
+#
+# DELIBERATE EXCEPTION to the "scapy + Npcap only" rule, approved for this
+# feature. It is SOFT: imported on demand, and if it is missing the camera tab
+# says so while every other test, the GUI, --selftest and --verify behave
+# exactly as before. Do not turn this into a hard import.
+
+_CV2 = None
+CV2_ERR = ""
+
+
+def load_cv2():
+    """Import OpenCV on first use. Returns the module or None."""
+    global _CV2, CV2_ERR
+    if _CV2 is not None:
+        return _CV2
+    if CV2_ERR:
+        return None
+    try:
+        import cv2  # type: ignore
+        _CV2 = cv2
+    except Exception as e:
+        CV2_ERR = str(e)
+        return None
+    return _CV2
+
+
+def jpeg_to_bgr(cv2mod, jpeg: bytes):
+    """Decode JPEG bytes to an OpenCV BGR image (None if undecodable)."""
+    import numpy as np      # ships with opencv-python; never imported without it
+    return cv2mod.imdecode(np.frombuffer(jpeg, dtype=np.uint8),
+                           cv2mod.IMREAD_COLOR)
+
+
+def bgr_to_ppm(cv2mod, img) -> bytes:
+    """
+    Wrap a decoded BGR image as a binary PPM (P6).
+
+    Tk 8.6's photo image reads PPM straight from a byte string, so the video can
+    be displayed without adding Pillow on top of OpenCV. One new dependency for
+    this feature is already an exception; two would be worse.
+    """
+    rgb = cv2mod.cvtColor(img, cv2mod.COLOR_BGR2RGB)
+    h, w = rgb.shape[0], rgb.shape[1]
+    return b"P6\n%d %d\n255\n" % (w, h) + rgb.tobytes()
+
+
+class CameraLink:
+    """
+    Owns the webcam, the TX thread and the RX capture for the video channel.
+
+    Threading follows the rest of the tool: this object never touches a Tk
+    widget. It pushes JPEG bytes and counters onto the GUI queue via `emit`,
+    and the Tk main thread turns them into images inside App._pump().
+
+    The capture side REUSES Receiver (section 4) with a kernel BPF filter for
+    0x88B6 and its own snaplen, so we get the same pcap fast path, the same
+    host-drop accounting and no second capture stack. Receiver's per-stream
+    statistics are for the measurement codec, so a no-op parse_fn is passed and
+    the frames are taken from raw_hook instead.
+    """
+
+    def __init__(self, cv2mod, iface_tx: str, iface_rx: str, mac_src: str,
+                 mac_dst: str, emit: Callable[[str, object], None],
+                 dev: int = 0, width: int = 320, height: int = 240,
+                 fps: float = 12.0, quality: int = 60):
+        self.cv2 = cv2mod
+        self.iface_tx = iface_tx
+        self.iface_rx = iface_rx
+        self.mac_src = mac_src
+        self.mac_dst = mac_dst
+        self.emit = emit
+        self.dev = int(dev)
+        self.width = int(width)
+        self.height = int(height)
+        self.fps = max(1.0, float(fps))
+        self.quality = max(10, min(95, int(quality)))
+
+        self.asm = VideoAssembler()
+        self.sender: Optional[RawSender] = None
+        self.rx: Optional[Receiver] = None
+        self.cap = None
+        self.stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self.frame_id = 0
+        self.frames_sent = 0
+        self.chunks_sent = 0
+        self.bytes_sent = 0
+        self.cam_errors = 0
+        self.tx_errors = 0
+        self.hook_errors = 0
+        self.lat_ms = 0.0
+        self.t0 = 0.0
+        self._drop_base = 0
+
+    # ---- lifecycle ------------------------------------------------------
+    def open(self) -> None:
+        cv2 = self.cv2
+        # DirectShow opens far quicker than MSMF on Windows and is happier with
+        # cheap UVC webcams; fall back to whatever the platform default is.
+        backends = [getattr(cv2, "CAP_DSHOW", 0), 0] if os.name == "nt" else [0]
+        cap = None
+        for be in backends:
+            try:
+                cap = cv2.VideoCapture(self.dev, be) if be else cv2.VideoCapture(self.dev)
+            except Exception:
+                cap = None
+                continue
+            if cap is not None and cap.isOpened():
+                break
+            try:
+                cap.release()
+            except Exception:
+                pass
+            cap = None
+        if cap is None:
+            raise RuntimeError(
+                f"could not open camera index {self.dev}. Close any other app "
+                "using the webcam (Teams, Camera, browser) and try again, or "
+                "pick a different index.")
+        try:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+            cap.set(cv2.CAP_PROP_FPS, self.fps)
+        except Exception:
+            pass
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            try:
+                cap.release()
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"camera index {self.dev} opened but returned no image.")
+        self.cap = cap
+
+        self.sender = RawSender(self.iface_tx)
+        # Kernel filter is mandatory (invariant 10) - without it every frame on
+        # the wire would be handed to Python.
+        self.rx = Receiver(self.iface_rx, {}, raw_hook=self._on_capture,
+                           parse_fn=self._no_stats,
+                           bpf_override="ether proto 0x88b6",
+                           snaplen=VID_SNAPLEN)
+        self.rx.start()
+        self._drop_base = self.rx.kernel_drops()
+        self.emit("logc", (f"camera {self.dev} open, capture on {self.iface_rx} "
+                           f"({self.rx.mode})", MUT))
+
+    @staticmethod
+    def _no_stats(_data: bytes):
+        """Receiver's stats engine is for the 0x88B5 codec; video bypasses it."""
+        return None
+
+    def start(self) -> None:
+        self.stop_event.clear()
+        self.t0 = time.perf_counter()
+        self._thread = threading.Thread(target=self._tx_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=3.0)
+            self._thread = None
+        if self.rx is not None:
+            try:
+                self.rx.stop()
+            except Exception:
+                pass
+            self.rx = None
+        if self.sender is not None:
+            try:
+                self.sender.close()
+            except Exception:
+                pass
+            self.sender = None
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+            self.cap = None
+
+    # ---- receive side (pcap capture thread) ------------------------------
+    def _on_capture(self, data: bytes, rx_ns: int) -> None:
+        # Receiver swallows exceptions raised by a raw_hook, so count our own.
+        try:
+            done = self.asm.add(data, rx_ns)
+        except Exception:
+            self.hook_errors += 1
+            return
+        if done is None:
+            return
+        jpeg, tx_ns, rx_ns2 = done
+        lat = (rx_ns2 - tx_ns) / 1e6
+        # The pcap and now_ns() clocks are both host clocks but not the same
+        # counter, so a tiny negative delta is possible; clamp rather than lie.
+        self.lat_ms = max(0.0, lat)
+        self.emit("video", ("remote", jpeg, self.lat_ms))
+
+    # ---- transmit side ---------------------------------------------------
+    def _tx_loop(self) -> None:
+        cv2 = self.cv2
+        cap = self.cap
+        enc_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
+        interval = 1.0 / self.fps
+        next_t = time.perf_counter()
+        last_stat = 0.0
+        while not self.stop_event.is_set():
+            try:
+                ok, frame = cap.read()
+            except Exception:
+                ok, frame = False, None
+            if not ok or frame is None:
+                self.cam_errors += 1
+                if self.cam_errors > 200:
+                    self.emit("logc", ("camera stopped delivering images", BAD))
+                    break
+                time.sleep(0.05)
+                continue
+            try:
+                if frame.shape[1] != self.width or frame.shape[0] != self.height:
+                    # Some webcams ignore CAP_PROP_FRAME_* and hand back their
+                    # native size; scale so the offered bitrate stays predictable.
+                    frame = cv2.resize(frame, (self.width, self.height),
+                                       interpolation=cv2.INTER_AREA)
+                enc_ok, enc = cv2.imencode(".jpg", frame, enc_params)
+                if not enc_ok:
+                    self.cam_errors += 1
+                    continue
+                jpeg = enc.tobytes()
+            except Exception:
+                self.cam_errors += 1
+                continue
+
+            tx_ns = now_ns()
+            self.frame_id = (self.frame_id + 1) & 0xFFFF
+            try:
+                chunks = build_video_chunks(self.mac_dst, self.mac_src,
+                                            self.frame_id, jpeg, tx_ns)
+                send = self.sender.send
+                for c in chunks:
+                    send(c)
+            except Exception as e:
+                self.tx_errors += 1
+                if self.tx_errors == 1:
+                    self.emit("logc", (f"video TX failed: {e}", BAD))
+                time.sleep(0.1)
+                continue
+            self.frames_sent += 1
+            self.chunks_sent += len(chunks)
+            self.bytes_sent += sum(len(c) for c in chunks)
+            self.emit("video", ("local", jpeg, 0.0))
+
+            now = time.perf_counter()
+            if now - last_stat > 0.4:
+                last_stat = now
+                self.emit("vstats", self.stats())
+
+            # Pace the camera. Never busy-spin (invariant 3): the capture thread
+            # shares this GIL, and a spinning sender would drop the very frames
+            # we are trying to show.
+            next_t += interval
+            dt = next_t - time.perf_counter()
+            if dt > 0:
+                time.sleep(min(dt, 0.5))
+            else:
+                next_t = time.perf_counter()
+                time.sleep(0)
+        self.emit("vstats", self.stats())
+
+    # ---- reporting -------------------------------------------------------
+    def stats(self) -> Dict:
+        el = max(1e-6, time.perf_counter() - self.t0)
+        a = self.asm.stats()
+        host = 0
+        if self.rx is not None:
+            host = max(0, self.rx.kernel_drops() - self._drop_base)
+        d = {
+            "frames_sent": self.frames_sent,
+            "chunks_sent": self.chunks_sent,
+            "fps_tx": self.frames_sent / el,
+            "tx_mbps": mbps(self.bytes_sent, el, self.chunks_sent),
+            "lat_ms": self.lat_ms,
+            "cam_errors": self.cam_errors,
+            "tx_errors": self.tx_errors,
+            "hook_errors": self.hook_errors,
+            # Host capture drops are a PC limit, never a switch fault
+            # (invariant 1) - shown separately, never folded into video loss.
+            "host_drops": host,
+        }
+        d.update(a)
+        shown = a["frames_complete"]
+        d["intact_pct"] = (100.0 * shown / self.frames_sent) if self.frames_sent else 0.0
+        return d
+
+
+# ==========================================================================
+# 4d. USB HUB TEST via a real HID device (Windows Raw Input + PnP telemetry)
+# ==========================================================================
+#
+# The Ethernet DUT is tested by looping two of the PC's own ports through it. A
+# USB hub CANNOT be tested that way: a passive hub has exactly one meaningful
+# upstream link and USB has no host-to-host mode, so wiring a hub's downstream
+# port back into a second PC port just enumerates a second "Generic USB Hub" -
+# no bridge, no traffic. That is a property of USB, not a missing driver.
+#
+# So the hub is tested the way it is actually used: with a real device on a
+# downstream port. We watch a chosen HID mouse's input reports with precise
+# timestamps and compare a BASELINE run (mouse straight into the PC) against a
+# THROUGH-HUB run, plus PnP connection-reliability telemetry over the window.
+#
+#     mouse -> [hub downstream port] -> hub -> root hub -> PC   (through hub)
+#     mouse -> PC port                                          (baseline)
+#
+# Two mechanisms, both dependency-free (ctypes + subprocess are stdlib and
+# already used in this file, so this feature needs no exception to the
+# dependency rule the way OpenCV did):
+#
+#   1. Win32 Raw Input. This is the OS-sanctioned way to read per-device mouse
+#      reports - Windows deliberately restricts opening a mouse/keyboard as a
+#      generic HID handle from user mode, so hidapi is the wrong tool here.
+#      Registration is purely OBSERVATIONAL: RIDEV_INPUTSINK delivers a copy of
+#      the input without focus and without stealing or blocking it, so the
+#      mouse keeps working normally in every other application while we watch.
+#   2. Get-PnpDevice polling for the mouse and its hub ancestor, diffed between
+#      polls to catch disconnects and recoveries. Same subprocess pattern as
+#      App._netadapter_info(). Honest limit: this reports PnP STATUS
+#      TRANSITIONS only. Precise USB error/reset codes are not reliably
+#      obtainable from user mode without a kernel driver, so this code does not
+#      pretend to have them.
+#
+# What it measures: inter-report interval, jitter, percentiles, long gaps and
+# connection stability. NOT throughput - a mouse offers a few kB/s, so this can
+# never load a hub. It answers "does this hub carry a real device cleanly and
+# stay connected", which is the question a bench hub actually fails.
+
+USB_PHASE_BASE = "Baseline - direct to PC"
+USB_PHASE_HUB = "Through Hub"
+
+RIM_TYPEMOUSE = 0
+RIDI_DEVICENAME = 0x20000007
+RID_INPUT = 0x10000003
+RIDEV_REMOVE = 0x00000001
+RIDEV_INPUTSINK = 0x00000100
+WM_INPUT = 0x00FF
+WM_QUIT = 0x0012
+WM_DESTROY = 0x0002
+HWND_MESSAGE = -3
+RI_MOUSE_WHEEL = 0x0400
+
+
+# ---- portable ctypes layouts (no ctypes.wintypes: it fails to import on
+# non-Windows, and the selftest for this codec must run anywhere) -----------
+
+class RAWINPUTHEADER(ctypes.Structure):
+    _fields_ = [("dwType", ctypes.c_ulong),
+                ("dwSize", ctypes.c_ulong),
+                ("hDevice", ctypes.c_void_p),
+                ("wParam", ctypes.c_void_p)]
+
+
+class RAWMOUSE(ctypes.Structure):
+    # usFlags is followed by a union { ULONG ulButtons; struct { USHORT
+    # usButtonFlags; USHORT usButtonData; } }. The union is 4-byte aligned, so
+    # there are 2 bytes of padding after usFlags - declaring the USHORTs
+    # back-to-back without it would read usButtonFlags 2 bytes too early and
+    # silently mis-report every click.
+    _fields_ = [("usFlags", ctypes.c_ushort),
+                ("_pad", ctypes.c_ushort),
+                ("usButtonFlags", ctypes.c_ushort),
+                ("usButtonData", ctypes.c_ushort),
+                ("ulRawButtons", ctypes.c_ulong),
+                ("lLastX", ctypes.c_long),
+                ("lLastY", ctypes.c_long),
+                ("ulExtraInformation", ctypes.c_ulong)]
+
+
+class RAWINPUT(ctypes.Structure):
+    _fields_ = [("header", RAWINPUTHEADER), ("mouse", RAWMOUSE)]
+
+
+class RAWINPUTDEVICELIST(ctypes.Structure):
+    _fields_ = [("hDevice", ctypes.c_void_p), ("dwType", ctypes.c_ulong)]
+
+
+class RAWINPUTDEVICE(ctypes.Structure):
+    _fields_ = [("usUsagePage", ctypes.c_ushort), ("usUsage", ctypes.c_ushort),
+                ("dwFlags", ctypes.c_ulong), ("hwndTarget", ctypes.c_void_p)]
+
+
+class MSG(ctypes.Structure):
+    _fields_ = [("hwnd", ctypes.c_void_p), ("message", ctypes.c_uint),
+                ("wParam", ctypes.c_void_p), ("lParam", ctypes.c_void_p),
+                ("time", ctypes.c_ulong),
+                ("pt_x", ctypes.c_long), ("pt_y", ctypes.c_long)]
+
+
+def parse_rawinput_mouse(buf) -> Optional[Dict]:
+    """
+    Decode a RAWINPUT buffer into a plain dict, or None if it is not a mouse
+    report. Split out from the message loop so it can be tested offline.
+    """
+    need = ctypes.sizeof(RAWINPUT)
+    b = bytes(buf)
+    if len(b) < need:
+        return None
+    ri = RAWINPUT.from_buffer_copy(b[:need])
+    if ri.header.dwType != RIM_TYPEMOUSE:
+        return None
+    btn = ri.mouse.usButtonFlags
+    wheel = 0
+    if btn & RI_MOUSE_WHEEL:
+        # usButtonData carries a SIGNED wheel delta in this case
+        wheel = ri.mouse.usButtonData
+        if wheel >= 0x8000:
+            wheel -= 0x10000
+    return {"hDevice": int(ri.header.hDevice or 0),
+            "flags": ri.mouse.usFlags,
+            "buttons": btn,
+            "dx": ri.mouse.lLastX,
+            "dy": ri.mouse.lLastY,
+            "wheel": wheel}
+
+
+def rawinput_path_to_instance_id(path: str) -> str:
+    r"""
+    Convert a Raw Input device path to a PnP InstanceId.
+
+        \\?\HID#VID_046D&PID_C548&MI_01&Col01#8&3837cee4&0&0000#{guid}
+        -> HID\VID_046D&PID_C548&MI_01&COL01\8&3837CEE4&0&0000
+
+    That exact string is what Get-PnpDevice takes, so the two worlds can be
+    joined without any fuzzy name matching.
+    """
+    p = path or ""
+    if p.startswith("\\\\?\\"):
+        p = p[4:]
+    parts = p.split("#")
+    if len(parts) >= 3:
+        return "\\".join(parts[:3]).upper()
+    return p.upper()
+
+
+def _id_field(path: str, key: str) -> str:
+    """
+    Pull VID/PID out of a device path.
+
+    USB devices use `VID_046D`, but a Bluetooth HID device uses
+    `..._Dev_VID&02046d_PID&b042_...` - a 6-digit field whose last 4 digits are
+    the ID. Matching only the USB form left every Bluetooth mouse labelled
+    "unknown VID/PID" in the picker.
+    """
+    m = re.search(key + r"_([0-9A-Fa-f]{4})(?![0-9A-Fa-f])", path or "")
+    if m:
+        return m.group(1).upper()
+    m = re.search(key + r"&([0-9A-Fa-f]{4,6})", path or "")
+    if m:
+        return m.group(1)[-4:].upper()
+    return ""
+
+
+def enum_raw_mice() -> List[Dict]:
+    """Every mouse Raw Input knows about: handle, device path, VID/PID, PnP id."""
+    out: List[Dict] = []
+    if os.name != "nt":
+        return out
+    try:
+        u = ctypes.windll.user32
+        u.GetRawInputDeviceList.argtypes = [ctypes.c_void_p,
+                                           ctypes.POINTER(ctypes.c_uint),
+                                           ctypes.c_uint]
+        u.GetRawInputDeviceList.restype = ctypes.c_int
+        u.GetRawInputDeviceInfoW.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                            ctypes.c_void_p,
+                                            ctypes.POINTER(ctypes.c_uint)]
+        u.GetRawInputDeviceInfoW.restype = ctypes.c_int
+        cb = ctypes.sizeof(RAWINPUTDEVICELIST)
+        n = ctypes.c_uint(0)
+        u.GetRawInputDeviceList(None, ctypes.byref(n), cb)
+        if n.value == 0:
+            return out
+        arr = (RAWINPUTDEVICELIST * n.value)()
+        got = u.GetRawInputDeviceList(ctypes.byref(arr), ctypes.byref(n), cb)
+        if got <= 0:
+            return out
+        for i in range(min(got, n.value)):
+            d = arr[i]
+            if d.dwType != RIM_TYPEMOUSE:
+                continue
+            need = ctypes.c_uint(0)
+            u.GetRawInputDeviceInfoW(d.hDevice, RIDI_DEVICENAME, None,
+                                     ctypes.byref(need))
+            if need.value == 0 or need.value > 4096:
+                continue
+            sbuf = ctypes.create_unicode_buffer(need.value + 1)
+            if u.GetRawInputDeviceInfoW(d.hDevice, RIDI_DEVICENAME, sbuf,
+                                       ctypes.byref(need)) <= 0:
+                continue
+            path = sbuf.value
+            out.append({"handle": int(d.hDevice or 0), "path": path,
+                        "vid": _id_field(path, "VID"),
+                        "pid": _id_field(path, "PID"),
+                        "iid": rawinput_path_to_instance_id(path)})
+    except Exception:
+        return out
+    return out
+
+
+# ---- PnP helpers (same subprocess shape as App._netadapter_info) -----------
+
+def _ps_json(script: str, timeout: float = 25.0):
+    """Run a PowerShell snippet and parse its JSON output, or return None."""
+    if os.name != "nt":
+        return None
+    try:
+        flags = 0x08000000                      # CREATE_NO_WINDOW
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", script],
+                             capture_output=True, text=True, timeout=timeout,
+                             creationflags=flags).stdout
+        out = (out or "").strip()
+        if not out:
+            return None
+        return json.loads(out)
+    except Exception:
+        return None
+
+
+def pnp_mouse_names() -> Dict[str, str]:
+    """InstanceId (upper) -> FriendlyName, for every present mouse."""
+    data = _ps_json(
+        "Get-PnpDevice -Class Mouse -PresentOnly -ErrorAction SilentlyContinue |"
+        " ForEach-Object { [pscustomobject]@{Id=$_.InstanceId;"
+        " Name=[string]$_.FriendlyName} } | ConvertTo-Json -Compress")
+    if data is None:
+        return {}
+    if isinstance(data, dict):
+        data = [data]
+    res = {}
+    for d in data:
+        i = (d.get("Id") or "").upper()
+        if i:
+            res[i] = d.get("Name") or ""
+    return res
+
+
+def pnp_parent_chain(instance_id: str, depth: int = 7) -> List[Dict]:
+    """
+    Walk DEVPKEY_Device_Parent up the PnP tree from a device.
+
+    One PowerShell invocation for the whole chain: a call per level would cost
+    ~0.5 s each. Returns [{name, status, id}, ...] starting at the device.
+    """
+    if not instance_id:
+        return []
+    safe = instance_id.replace("'", "''")
+    script = (
+        f"$id='{safe}'; $out=@(); for($i=0;$i -lt {int(depth)};$i++){{"
+        " $d=Get-PnpDevice -InstanceId $id -ErrorAction SilentlyContinue;"
+        " if(-not $d){break};"
+        " $out+=[pscustomobject]@{name=[string]$d.FriendlyName;"
+        " status=[string]$d.Status; id=[string]$d.InstanceId};"
+        " $p=Get-PnpDeviceProperty -InstanceId $id"
+        " -KeyName 'DEVPKEY_Device_Parent' -ErrorAction SilentlyContinue;"
+        " if(-not $p -or -not $p.Data){break}; $id=[string]$p.Data };"
+        " $out | ConvertTo-Json -Compress")
+    data = _ps_json(script)
+    if data is None:
+        return []
+    if isinstance(data, dict):
+        data = [data]
+    return [{"name": d.get("name") or "", "status": d.get("status") or "",
+             "id": d.get("id") or ""} for d in data if isinstance(d, dict)]
+
+
+def find_hub_ancestor(chain: List[Dict]) -> Optional[Dict]:
+    """
+    First EXTERNAL hub above the device, i.e. a hub that is not a root hub.
+
+    A device plugged straight into the PC still has a "USB Root Hub" ancestor,
+    which is part of the host controller, not the DUT. Only a real hub above the
+    device means we are testing the hub.
+    """
+    for d in chain[1:]:
+        n = (d.get("name") or "").lower()
+        if "hub" in n and "root" not in n:
+            return d
+    return None
+
+
+def pnp_status(ids: List[str]) -> Dict[str, Dict]:
+    """InstanceId (upper) -> {status, problem} for the given devices."""
+    ids = [i for i in ids if i]
+    if not ids:
+        return {}
+    lst = ",".join("'" + i.replace("'", "''") + "'" for i in ids)
+    data = _ps_json(
+        f"Get-PnpDevice -InstanceId {lst} -ErrorAction SilentlyContinue |"
+        " ForEach-Object { [pscustomobject]@{Id=$_.InstanceId;"
+        " Status=[string]$_.Status; Problem=[string]$_.Problem} } |"
+        " ConvertTo-Json -Compress", timeout=25.0)
+    if data is None:
+        return {}
+    if isinstance(data, dict):
+        data = [data]
+    res = {}
+    for d in data:
+        i = (d.get("Id") or "").upper()
+        if i:
+            res[i] = {"status": d.get("Status") or "", "problem": d.get("Problem") or ""}
+    return res
+
+
+def pnp_diff(prev: Dict[str, Dict], cur: Dict[str, Dict]) -> List[Dict]:
+    """
+    Compare two PnP snapshots and return the transitions worth logging.
+
+    'fault' = left OK (or vanished from the tree entirely, which is what an
+    unplug looks like). 'recovered' = came back to OK. Steady state produces
+    nothing, so the event log only ever contains real changes. The FIRST
+    snapshot has no predecessor and therefore reports nothing unless the device
+    is already unhealthy.
+    """
+    events: List[Dict] = []
+    for k, c in cur.items():
+        cs = (c.get("status") or "").upper()
+        p = prev.get(k)
+        if p is None:
+            if cs and cs != "OK":
+                events.append({"id": k, "kind": "fault", "from": "-", "to": cs,
+                               "problem": c.get("problem", "")})
+            continue
+        ps = (p.get("status") or "").upper()
+        if ps == cs:
+            continue
+        events.append({"id": k, "kind": "recovered" if cs == "OK" else "fault",
+                       "from": ps or "-", "to": cs or "-",
+                       "problem": c.get("problem", "")})
+    for k, p in prev.items():
+        if k not in cur:
+            events.append({"id": k, "kind": "fault",
+                           "from": (p.get("status") or "-").upper(),
+                           "to": "GONE", "problem": ""})
+    return events
+
+
+class IntervalStats:
+    """
+    Inter-report interval statistics for one HID device.
+
+    Percentiles use the same reservoir sampling as StreamStats (invariant 11) so
+    a long run is not biased towards its first seconds.
+
+    IMPORTANT interpretation rule: a mouse only reports while it is being moved.
+    The multi-second silence when the user lets go is NOT a dropout, and
+    counting it as "longest gap" would invent a hardware fault out of a coffee
+    break. Intervals longer than IDLE_MS are therefore excluded from avg,
+    jitter, percentiles and max-gap, and counted separately as `pauses`. Same
+    principle as the Ethernet path: never manufacture a fault the DUT did not
+    commit.
+    """
+
+    MAX_SAMPLES = 50_000
+    IDLE_MS = 250.0
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.reset()
+
+    def reset(self) -> None:
+        with self.lock:
+            self.reports = 0
+            self.moves = 0
+            self.buttons = 0
+            self.wheels = 0
+            self.pauses = 0
+            self.iv: List[float] = []          # ms, reservoir
+            self.seen = 0
+            self.sum_ms = 0.0
+            self.n_iv = 0
+            self.min_ms = None
+            self.max_ms = None
+            self.prev_iv = None
+            self.jitter_ms = 0.0
+            self.t_prev = None
+            self.t_first = None
+            self.t_last = None
+
+    def add(self, t: float, dx: int, dy: int, buttons: int, wheel: int) -> None:
+        with self.lock:
+            self.reports += 1
+            if dx or dy:
+                self.moves += 1
+            if buttons and not (buttons & RI_MOUSE_WHEEL):
+                self.buttons += 1
+            if wheel:
+                self.wheels += 1
+            if self.t_first is None:
+                self.t_first = t
+            self.t_last = t
+            if self.t_prev is not None:
+                ms = (t - self.t_prev) * 1000.0
+                if ms > self.IDLE_MS:
+                    self.pauses += 1        # user stopped moving: not a fault
+                elif ms >= 0.0:
+                    self.n_iv += 1
+                    self.sum_ms += ms
+                    if self.min_ms is None or ms < self.min_ms:
+                        self.min_ms = ms
+                    if self.max_ms is None or ms > self.max_ms:
+                        self.max_ms = ms
+                    self.seen += 1
+                    if len(self.iv) < self.MAX_SAMPLES:
+                        self.iv.append(ms)
+                    else:
+                        j = random.randrange(self.seen)
+                        if j < self.MAX_SAMPLES:
+                            self.iv[j] = ms
+                    if self.prev_iv is not None:
+                        d = abs(ms - self.prev_iv)
+                        self.jitter_ms += (d - self.jitter_ms) / 16.0
+                    self.prev_iv = ms
+            self.t_prev = t
+
+    def snapshot(self) -> Dict:
+        with self.lock:
+            s = sorted(self.iv)
+            n_iv = self.n_iv
+            avg = (self.sum_ms / n_iv) if n_iv else 0.0
+            d = {"reports": self.reports, "moves": self.moves,
+                 "buttons": self.buttons, "wheels": self.wheels,
+                 "pauses": self.pauses, "intervals": n_iv,
+                 "avg_ms": avg, "jitter_ms": self.jitter_ms,
+                 "min_ms": self.min_ms or 0.0, "max_gap_ms": self.max_ms or 0.0,
+                 # Rate WHILE MOVING. Dividing by wall-clock elapsed would just
+                 # measure how much the user fidgeted, not the device's rate.
+                 "rps_moving": (1000.0 / avg) if avg > 0 else 0.0,
+                 "active_s": ((self.t_last - self.t_first)
+                              if (self.t_first is not None and self.t_last is not None)
+                              else 0.0)}
+
+        def pct(p):
+            if not s:
+                return 0.0
+            i = min(len(s) - 1, max(0, int(round(p / 100.0 * (len(s) - 1)))))
+            return s[i]
+        d["p50_ms"] = pct(50)
+        d["p95_ms"] = pct(95)
+        d["p99_ms"] = pct(99)
+        return d
+
+
+class UsbHidLink:
+    """
+    Watches one HID mouse and its hub, on two daemon threads.
+
+    Same shape as CameraLink / Receiver: the constructor takes `emit`, `start()`
+    spins the threads, `stop()` sets an Event and joins, and NO worker thread
+    ever touches a Tk widget - everything crosses via emit() -> App.q ->
+    _pump() on the Tk thread.
+    """
+
+    TICK_S = 0.3            # stats emit cadence
+    POLL_EVERY = 5          # PnP poll every 5th tick (~1.5 s)
+
+    def __init__(self, emit: Callable[[str, object], None], handle: int,
+                 path: str = "", name: str = "", mouse_id: str = "",
+                 phase: str = ""):
+        self.emit = emit
+        self.handle = int(handle or 0)
+        self.path = path
+        self.name = name or "mouse"
+        self.mouse_id = (mouse_id or "").upper()
+        self.phase = phase
+        self.stats = IntervalStats()
+        self.stop_event = threading.Event()
+        self._in_thread: Optional[threading.Thread] = None
+        self._poll_thread: Optional[threading.Thread] = None
+        self._tid = 0
+        # The WINFUNCTYPE callback MUST stay referenced for as long as the
+        # window exists. If Python garbage-collects it, Windows calls into freed
+        # memory and the process dies with no Python traceback.
+        self._wndproc = None
+        self._wndclass = None
+        self._hwnd = None
+        self._clsname = ""
+        self.hub_id = ""
+        self.hub_name = ""
+        self.chain: List[Dict] = []
+        self.faults = 0
+        self.recoveries = 0
+        self.status_txt = "starting"
+        self.err = ""
+        self.t0 = 0.0
+        self._last_pnp: Dict[str, Dict] = {}
+
+    # ---- lifecycle ------------------------------------------------------
+    def start(self) -> None:
+        self.t0 = time.perf_counter()
+        self.stop_event.clear()
+        self._in_thread = threading.Thread(target=self._input_thread, daemon=True)
+        self._in_thread.start()
+        self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._poll_thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.status_txt == "capturing":
+            self.status_txt = "stopped"
+        # GetMessageW blocks; the only clean way out is a WM_QUIT posted to that
+        # specific thread, which makes it return 0 and fall out of the loop.
+        if self._tid and os.name == "nt":
+            try:
+                u = ctypes.windll.user32
+                u.PostThreadMessageW.argtypes = [ctypes.c_ulong, ctypes.c_uint,
+                                                ctypes.c_void_p, ctypes.c_void_p]
+                u.PostThreadMessageW(self._tid, WM_QUIT, None, None)
+            except Exception:
+                pass
+        for t in (self._in_thread, self._poll_thread):
+            if t is not None:
+                t.join(timeout=3.0)
+        self._in_thread = self._poll_thread = None
+
+    # ---- raw input ------------------------------------------------------
+    def _input_thread(self) -> None:
+        try:
+            self._run_input()
+        except Exception as e:
+            self.err = str(e)
+            self.status_txt = "failed"
+            self.emit("usbevent", {"kind": "error",
+                                   "text": f"raw input failed: {e}"})
+            self.emit("usbstate", ("failed", str(e)))
+
+    def _run_input(self) -> None:
+        if os.name != "nt":
+            raise RuntimeError("Raw Input capture is Windows-only")
+        u = ctypes.windll.user32
+        k = ctypes.windll.kernel32
+        self._tid = int(k.GetCurrentThreadId())
+
+        # EVERY pointer-sized argument and return value must be declared.
+        # ctypes otherwise guesses from the Python value and a 64-bit HINSTANCE
+        # raises "int too long to convert", while an undeclared HWND return gets
+        # truncated to 32 bits and every later call quietly fails.
+        cvp, cu, ci = ctypes.c_void_p, ctypes.c_uint, ctypes.c_int
+        u.DefWindowProcW.argtypes = [cvp, cu, cvp, cvp]
+        u.DefWindowProcW.restype = ctypes.c_ssize_t
+        u.CreateWindowExW.argtypes = [ctypes.c_ulong, ctypes.c_wchar_p,
+                                      ctypes.c_wchar_p, ctypes.c_ulong,
+                                      ci, ci, ci, ci, cvp, cvp, cvp, cvp]
+        u.CreateWindowExW.restype = cvp
+        u.RegisterClassW.restype = ctypes.c_ushort
+        u.DestroyWindow.argtypes = [cvp]
+        u.UnregisterClassW.argtypes = [ctypes.c_wchar_p, cvp]
+        u.RegisterRawInputDevices.argtypes = [cvp, cu, cu]
+        u.RegisterRawInputDevices.restype = ctypes.c_bool
+        u.GetRawInputData.argtypes = [cvp, cu, cvp,
+                                      ctypes.POINTER(cu), cu]
+        u.GetRawInputData.restype = cu
+        u.GetMessageW.argtypes = [ctypes.POINTER(MSG), cvp, cu, cu]
+        u.GetMessageW.restype = ci
+        u.TranslateMessage.argtypes = [ctypes.POINTER(MSG)]
+        u.DispatchMessageW.argtypes = [ctypes.POINTER(MSG)]
+        u.DispatchMessageW.restype = ctypes.c_ssize_t
+        k.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
+        k.GetModuleHandleW.restype = cvp
+
+        WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_void_p,
+                                     ctypes.c_uint, ctypes.c_void_p,
+                                     ctypes.c_void_p)
+
+        class WNDCLASSW(ctypes.Structure):
+            _fields_ = [("style", ctypes.c_uint), ("lpfnWndProc", WNDPROC),
+                        ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+                        ("hInstance", ctypes.c_void_p), ("hIcon", ctypes.c_void_p),
+                        ("hCursor", ctypes.c_void_p),
+                        ("hbrBackground", ctypes.c_void_p),
+                        ("lpszMenuName", ctypes.c_wchar_p),
+                        ("lpszClassName", ctypes.c_wchar_p)]
+
+        def wndproc(hwnd, msg, wp, lp):
+            if msg == WM_INPUT:
+                try:
+                    self._on_wm_input(lp)
+                except Exception:
+                    pass
+            return u.DefWindowProcW(hwnd, msg, wp, lp)
+
+        self._wndproc = WNDPROC(wndproc)          # keep alive on self
+        hinst = k.GetModuleHandleW(None)
+        cls = WNDCLASSW()
+        cls.lpfnWndProc = self._wndproc
+        cls.hInstance = hinst
+        self._clsname = f"EthSwUsbRawInput_{os.getpid()}_{id(self) & 0xFFFFFF}"
+        cls.lpszClassName = self._clsname
+        self._wndclass = cls                       # keeps lpszClassName alive
+        if not u.RegisterClassW(ctypes.byref(cls)):
+            raise RuntimeError(f"RegisterClassW failed ({ctypes.GetLastError()})")
+
+        hwnd = None
+        registered = False
+        try:
+            # A message-only window (HWND_MESSAGE parent) is invisible, has no
+            # taskbar presence, and is still a legal RegisterRawInputDevices
+            # target.
+            hwnd = u.CreateWindowExW(0, self._clsname, "ethsw-usb", 0, 0, 0, 0, 0,
+                                     ctypes.c_void_p(HWND_MESSAGE), None,
+                                     hinst, None)
+            if not hwnd:
+                raise RuntimeError(f"CreateWindowExW failed ({ctypes.GetLastError()})")
+            self._hwnd = hwnd
+            rid = RAWINPUTDEVICE()
+            rid.usUsagePage = 0x01          # generic desktop
+            rid.usUsage = 0x02              # mouse
+            # INPUTSINK = observe without focus, and WITHOUT taking the input
+            # away from whatever app the user is actually using.
+            rid.dwFlags = RIDEV_INPUTSINK
+            rid.hwndTarget = ctypes.c_void_p(hwnd)
+            if not u.RegisterRawInputDevices(ctypes.byref(rid), 1,
+                                             ctypes.sizeof(RAWINPUTDEVICE)):
+                raise RuntimeError("RegisterRawInputDevices failed "
+                                   f"({ctypes.GetLastError()})")
+            registered = True
+            self.status_txt = "capturing"
+            self.emit("usbstate", ("running", ""))
+
+            msg = MSG()
+            while not self.stop_event.is_set():
+                r = u.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if r == 0 or r == -1:       # WM_QUIT, or error
+                    break
+                u.TranslateMessage(ctypes.byref(msg))
+                u.DispatchMessageW(ctypes.byref(msg))
+        finally:
+            try:
+                if registered:
+                    rid = RAWINPUTDEVICE()
+                    rid.usUsagePage = 0x01
+                    rid.usUsage = 0x02
+                    rid.dwFlags = RIDEV_REMOVE
+                    rid.hwndTarget = None       # must be NULL for REMOVE
+                    u.RegisterRawInputDevices(ctypes.byref(rid), 1,
+                                              ctypes.sizeof(RAWINPUTDEVICE))
+            except Exception:
+                pass
+            try:
+                if hwnd:
+                    u.DestroyWindow(ctypes.c_void_p(hwnd))
+            except Exception:
+                pass
+            try:
+                u.UnregisterClassW(self._clsname, hinst)
+            except Exception:
+                pass
+            self._hwnd = None
+
+    def _on_wm_input(self, lp) -> None:
+        u = ctypes.windll.user32
+        size = ctypes.c_uint(0)
+        hdr = ctypes.sizeof(RAWINPUTHEADER)
+        u.GetRawInputData(lp, RID_INPUT, None, ctypes.byref(size), hdr)
+        if size.value == 0 or size.value > 4096:
+            return
+        buf = ctypes.create_string_buffer(size.value)
+        got = u.GetRawInputData(lp, RID_INPUT, buf, ctypes.byref(size), hdr)
+        if got == 0xFFFFFFFF or got == 0:
+            return
+        d = parse_rawinput_mouse(buf.raw)
+        if d is None:
+            return
+        # Other mice / the trackpad keep working normally; we simply do not
+        # count their reports, so a second pointing device cannot pollute the
+        # measurement of the one under test.
+        if self.handle and d["hDevice"] != self.handle:
+            return
+        self.stats.add(time.perf_counter(), d["dx"], d["dy"], d["buttons"],
+                       d["wheel"])
+
+    # ---- PnP reliability poll + stats ticker ------------------------------
+    def _poll_loop(self) -> None:
+        """
+        One thread does both the PnP poll and the stats emit. Stats are pushed on
+        a fixed ~0.3 s tick rather than per input report: a mouse can report
+        1000x/s, and one queue item per report would drown the GUI. It also
+        means the display keeps updating while the mouse sits still.
+        """
+        ids = [i for i in (self.mouse_id, self.hub_id) if i]
+        tick = 0
+        while not self.stop_event.is_set():
+            if tick % self.POLL_EVERY == 0:
+                ids = [i for i in (self.mouse_id, self.hub_id) if i]
+                if ids:
+                    cur = pnp_status(ids)
+                    if cur:
+                        for ev in pnp_diff(self._last_pnp, cur):
+                            if ev["kind"] == "fault":
+                                self.faults += 1
+                            else:
+                                self.recoveries += 1
+                            ev["name"] = (self.hub_name
+                                          if ev["id"] == self.hub_id else self.name)
+                            self.emit("usbevent", ev)
+                        self._last_pnp = cur
+                    elif self._last_pnp:
+                        # Query returned nothing at all: treat as the devices
+                        # having vanished, which is what an unplug looks like.
+                        for ev in pnp_diff(self._last_pnp, {}):
+                            self.faults += 1
+                            ev["name"] = self.name
+                            self.emit("usbevent", ev)
+                        self._last_pnp = {}
+            tick += 1
+            self.emit("usbstats", self.snapshot())
+            self.stop_event.wait(self.TICK_S)
+
+    def snapshot(self) -> Dict:
+        d = self.stats.snapshot()
+        d.update({"faults": self.faults, "recoveries": self.recoveries,
+                  "status": self.status_txt, "phase": self.phase,
+                  "elapsed_s": max(0.0, time.perf_counter() - self.t0),
+                  "name": self.name, "hub_name": self.hub_name})
+        return d
+
+
+# --- verdict --------------------------------------------------------------
+# The numbers above are evidence; this turns them into a conclusion. Thresholds
+# for the Baseline vs Through Hub comparison:
+#
+# A hub is a repeater, not a scheduler - it does not change how often the device
+# chooses to report - so the honest expectation is "no meaningful change", and
+# real overhead is what we are looking for. The margins are deliberately
+# generous: both phases are driven by hand with a noisy source (and a wireless
+# mouse adds an RF hop of its own), so sub-millisecond run-to-run spread is
+# normal and a tighter bar would fail perfectly good hubs. A delta passes if it
+# is small in ABSOLUTE terms or small RELATIVE to the baseline, whichever is
+# kinder - 1 ms is nothing next to a 125 Hz mouse's 8 ms period, but it would be
+# a third of a 1000 Hz one's.
+USB_VERDICT_AVG_MS = 1.0     # avg interval may drift this much...
+USB_VERDICT_JIT_MS = 1.0     # ...and jitter this much...
+USB_VERDICT_REL = 0.25       # ...or by 25% of the baseline figure
+
+
+def usb_verdict(base: Optional[Dict], hub: Optional[Dict],
+                live_faults: int = 0, live_phase: str = "") -> Tuple[str, str]:
+    """Reduce the captured phases to ONE plain conclusion.
+
+    Returns (text, level) with level in 'ok' | 'warn' | 'bad' | 'mut', which the
+    GUI maps onto the same OK / WARN / BAD colours the Ethernet Results tab uses
+    for PASS / FAIL. Deliberately a pure function outside the GUI class so
+    --selftest can check the logic without a display.
+
+    Evidence in order of strength:
+      1. A connection fault beats every timing number. A hub that drops the
+         device is broken even if the intervals looked perfect while it was
+         still attached.
+      2. Both phases captured -> compare them against the margins above.
+      3. One phase only -> no comparison exists yet, so report what WAS
+         captured rather than showing nothing.
+    """
+    # 1. faults first - live ones included, so a disconnect lands in the verdict
+    #    the moment it happens rather than waiting for Stop.
+    faults, where = 0, ""
+    if live_faults > 0:
+        faults, where = live_faults, (live_phase or "this run")
+    elif hub and hub.get("faults", 0):
+        faults, where = hub["faults"], USB_PHASE_HUB
+    elif base and base.get("faults", 0):
+        faults, where = base["faults"], USB_PHASE_BASE
+    if faults:
+        return (f"ISSUES DETECTED - {faults} disconnect/reset event(s) during "
+                f"{where}", "bad")
+
+    # 2. both phases present -> the comparison this tab exists for
+    if base and hub:
+        d_avg = hub["avg_ms"] - base["avg_ms"]
+        d_jit = hub["jitter_ms"] - base["jitter_ms"]
+        ok_avg = abs(d_avg) <= max(USB_VERDICT_AVG_MS,
+                                   USB_VERDICT_REL * base["avg_ms"])
+        ok_jit = abs(d_jit) <= max(USB_VERDICT_JIT_MS,
+                                   USB_VERDICT_REL * base["jitter_ms"])
+        if ok_avg and ok_jit:
+            return (f"PASS - hub adds no meaningful latency or jitter "
+                    f"(avg {d_avg:+.2f} ms, jitter {d_jit:+.2f} ms, 0 faults)",
+                    "ok")
+        return (f"WARN - hub adds measurable latency/jitter: avg {d_avg:+.2f} ms, "
+                f"jitter {d_jit:+.2f} ms vs baseline, 0 faults. Judge whether "
+                f"that matters for your use case.", "warn")
+
+    # 3. one phase only - still say something conclusive about it
+    one = hub or base
+    if one is None:
+        return ("no verdict yet - capture a run and press Stop", "mut")
+    tag = USB_PHASE_HUB if one is hub else USB_PHASE_BASE
+    return (f"{tag} looks clean: {one['reports']} reports captured, 0 faults. "
+            f"Capture the other phase to compare the two.", "ok")
 
 
 # ==========================================================================
@@ -2721,6 +4039,21 @@ class App(tk.Tk):
         self.ifaces: List[Tuple[str, str, str]] = []   # (display, scapy_name, mac)
         self.console_rows = 0
         self._last_tap: Optional[Dict] = None
+        # --- camera passthrough (section 4c) state
+        self.cam: Optional[CameraLink] = None
+        self.cam_active = False
+        # newest JPEG per side, drained by _pump(): the display must never queue
+        # up stale video frames behind the live one.
+        self._cam_pending: Dict[str, Tuple] = {}
+        self._cam_img: Dict[str, object] = {}
+        self._cam_decode_errors = 0
+        # --- USB HID / hub test (section 4d) state
+        self.usb: Optional[UsbHidLink] = None
+        self.usb_active = False
+        self.usb_mice: List[Dict] = []
+        # captured snapshots per phase, so baseline and through-hub can be
+        # compared within one session
+        self.usb_samples: Dict[str, Dict] = {}
 
         self._style()
         self._build()
@@ -2774,7 +4107,70 @@ class App(tk.Tk):
 
     # ---- layout --------------------------------------------------------
     def _build(self):
-        top = tk.Frame(self, bg=BG)
+        """
+        Three sibling frames in the one Tk root, swapped with pack/pack_forget:
+        a landing screen, the Ethernet tool (everything that was here before,
+        unchanged apart from its parent) and the USB tool. ETH and USB now test
+        genuinely different hardware, so they get separate front doors instead of
+        one more notebook tab.
+        """
+        self.frame_landing = tk.Frame(self, bg=BG)
+        self.frame_eth = tk.Frame(self, bg=BG)
+        self.frame_usb = tk.Frame(self, bg=BG)
+        self._build_landing()
+        self._build_eth()
+        self._build_usb()
+        self._show_landing()
+
+    # ---- view switching -------------------------------------------------
+    def _show(self, target) -> None:
+        for f in (self.frame_landing, self.frame_eth, self.frame_usb):
+            f.pack_forget()
+        target.pack(fill="both", expand=True)
+
+    def _show_landing(self):
+        self._show(self.frame_landing)
+
+    def _show_eth(self):
+        self._show(self.frame_eth)
+
+    def _show_usb(self):
+        self._show(self.frame_usb)
+
+    def _build_landing(self):
+        f = self.frame_landing
+        wrap = tk.Frame(f, bg=BG)
+        wrap.place(relx=0.5, rely=0.42, anchor="center")
+        tk.Label(wrap, text="HARDWARE TEST BENCH", bg=BG, fg=MUT,
+                 font=("Segoe UI", 9, "bold")).pack(pady=(0, 4))
+        tk.Label(wrap, text="What are you testing?", bg=BG, fg=FG,
+                 font=("Segoe UI", 20, "bold")).pack(pady=(0, 24))
+
+        row = tk.Frame(wrap, bg=BG)
+        row.pack()
+        for col, (title, sub, cmd, color) in enumerate((
+                ("Test ETH  →",
+                 "KSZ8895 L2 switch\nraw 0x88B5 frames, loss / latency / jitter,\n"
+                 "11-test suite, camera passthrough",
+                 self._show_eth, ACC),
+                ("Test USB  →",
+                 "USB hub with a real HID device\nper-device input timing +\n"
+                 "connection reliability",
+                 self._show_usb, "#a78bfa"))):
+            card = tk.Frame(row, bg=CARD, highlightthickness=1,
+                            highlightbackground=GRID)
+            card.grid(row=0, column=col, padx=12, sticky="nsew")
+            b = self._btn(card, title, cmd, color, 20)
+            b.pack(padx=22, pady=(22, 10))
+            tk.Label(card, text=sub, bg=CARD, fg=MUT, font=("Segoe UI", 8),
+                     justify="center").pack(padx=22, pady=(0, 22))
+
+        tk.Label(wrap, text="Both tools measure real observed events, never "
+                            "inferred ones.",
+                 bg=BG, fg=MUT, font=("Segoe UI", 8)).pack(pady=(26, 0))
+
+    def _build_eth(self):
+        top = tk.Frame(self.frame_eth, bg=BG)
         top.pack(fill="x", padx=12, pady=(10, 6))
 
         # --- interface row
@@ -2855,6 +4251,8 @@ class App(tk.Tk):
             b.pack(side="left", padx=(0, 8))
         self.b_stop.configure(state="disabled")
         self._btn(ar, "Export Report", self.export_report, "#2b3242", 14).pack(side="right")
+        self._btn(ar, "← Back", self._show_landing, "#2b3242", 8).pack(
+            side="right", padx=(0, 8))
 
         self.pbar = ttk.Progressbar(top, style="H.Horizontal.TProgressbar", mode="determinate")
         self.pbar.pack(fill="x", pady=(8, 0))
@@ -2863,21 +4261,24 @@ class App(tk.Tk):
         self.status.pack(fill="x")
 
         # --- notebook
-        nb = ttk.Notebook(self)
+        nb = ttk.Notebook(self.frame_eth)
         nb.pack(fill="both", expand=True, padx=12, pady=(8, 12))
         self.tab_dash = tk.Frame(nb, bg=BG)
         self.tab_res = tk.Frame(nb, bg=BG)
         self.tab_bits = tk.Frame(nb, bg=BG)
+        self.tab_cam = tk.Frame(nb, bg=BG)
         self.tab_con = tk.Frame(nb, bg=BG)
         self.tab_log = tk.Frame(nb, bg=BG)
         nb.add(self.tab_dash, text="  Live Dashboard  ")
         nb.add(self.tab_res, text="  Results  ")
         nb.add(self.tab_bits, text="  Bits / Timing  ")
+        nb.add(self.tab_cam, text="  Camera Passthrough  ")
         nb.add(self.tab_con, text="  Frame Console  ")
         nb.add(self.tab_log, text="  Log  ")
         self._build_dash()
         self._build_results()
         self._build_bits()
+        self._build_camera()
         self._build_console()
         self._build_log()
 
@@ -3001,6 +4402,719 @@ class App(tk.Tk):
     def bits_refresh(self):
         self.bitview.nbits = int(self.v_nbits.get())
         self.bitview.redraw()
+
+    # ---- camera passthrough --------------------------------------------
+    def _build_camera(self):
+        """
+        Visual proof tab: local webcam on the left, the same image after a round
+        trip through the DUT on the right. Adapter A/B come from the global
+        PORT A / PORT B pickers at the top of the window, so there is exactly
+        one place in the tool that validates adapter choice.
+        """
+        bar = tk.Frame(self.tab_cam, bg=CARD, highlightthickness=1,
+                       highlightbackground=GRID)
+        bar.pack(fill="x", pady=(8, 0))
+        g = tk.Frame(bar, bg=CARD)
+        g.pack(fill="x", padx=10, pady=7)
+
+        def lab(txt, c):
+            tk.Label(g, text=txt, bg=CARD, fg=MUT,
+                     font=("Segoe UI", 7, "bold")).grid(row=0, column=c,
+                                                       sticky="w", padx=(0, 8))
+
+        self.v_cam_dev = tk.StringVar(value="0")
+        self.v_cam_res = tk.StringVar(value="320x240")
+        self.v_cam_fps = tk.StringVar(value="12")
+        self.v_cam_q = tk.StringVar(value="60")
+        self.v_cam_from = tk.StringVar(value="A -> B")
+
+        lab("CAMERA", 0); lab("RESOLUTION", 1); lab("FPS", 2)
+        lab("JPEG Q", 3); lab("SEND FROM", 4)
+        ttk.Combobox(g, textvariable=self.v_cam_dev, width=5, state="readonly",
+                     values=["0", "1", "2", "3"]).grid(row=1, column=0,
+                                                      sticky="w", padx=(0, 8))
+        ttk.Combobox(g, textvariable=self.v_cam_res, width=10, state="readonly",
+                     values=["320x240", "424x240", "640x480"]).grid(
+            row=1, column=1, sticky="w", padx=(0, 8))
+        ttk.Combobox(g, textvariable=self.v_cam_fps, width=5, state="readonly",
+                     values=["5", "10", "12", "15", "20"]).grid(
+            row=1, column=2, sticky="w", padx=(0, 8))
+        ttk.Combobox(g, textvariable=self.v_cam_q, width=5, state="readonly",
+                     values=["40", "50", "60", "70", "80"]).grid(
+            row=1, column=3, sticky="w", padx=(0, 8))
+        ttk.Combobox(g, textvariable=self.v_cam_from, width=9, state="readonly",
+                     values=["A -> B", "B -> A"]).grid(row=1, column=4,
+                                                      sticky="w", padx=(0, 14))
+        self.b_cam_start = self._btn(g, "Start Camera", self.cam_start, "#2ecc71", 14)
+        self.b_cam_start.grid(row=1, column=5, padx=(0, 8))
+        self.b_cam_stop = self._btn(g, "Stop Camera", self.cam_stop, BAD, 13)
+        self.b_cam_stop.grid(row=1, column=6)
+        self.b_cam_stop.configure(state="disabled")
+        self.lbl_cam = tk.Label(g, text="checking for OpenCV...", bg=CARD, fg=MUT,
+                                font=("Segoe UI", 8), anchor="w")
+        self.lbl_cam.grid(row=1, column=7, sticky="w", padx=(14, 0))
+        g.grid_columnconfigure(7, weight=1)
+
+        hint = tk.Label(
+            self.tab_cam,
+            text="Qualitative demo, not a measurement: the webcam is JPEG'd, "
+                 "chopped into raw EtherType 0x88B6 frames and sent through the "
+                 "switch, so you can SEE real payload crossing the fabric. For "
+                 "loss / latency / throughput numbers use the 0x88B5 test suite. "
+                 "Cable copper -> fiber -> media converter -> copper and the video "
+                 "crosses the fabric twice, through the 100BASE-FX SERDES.",
+            bg=BG, fg=MUT, font=("Segoe UI", 8), justify="left",
+            wraplength=1180, anchor="w")
+        hint.pack(fill="x", pady=(6, 2))
+        # A fixed wraplength wider than the window clips the tail of the text at
+        # the minimum window size, which is exactly the kind of layout bug this
+        # project only ever catches in a screenshot. Track the actual width.
+        self.tab_cam.bind(
+            "<Configure>",
+            lambda e, l=hint: l.configure(wraplength=max(320, e.width - 16)))
+
+        k = tk.Frame(self.tab_cam, bg=BG)
+        k.pack(fill="x", pady=(2, 4))
+        self.cam_kpi = {}
+        for key, label, wdt in [
+            ("sent", "Frames sent", 112), ("intact", "Intact", 100),
+            ("incomp", "Incomplete", 112), ("cmiss", "Chunks missing", 128),
+            ("ipct", "Intact %", 100), ("lat", "Frame lat ms", 116),
+            ("mbps", "TX Mbps", 104), ("hdrop", "Host drops", 112),
+        ]:
+            w = KPI(k, label, wdt)
+            w.pack(side="left", padx=(0, 8))
+            self.cam_kpi[key] = w
+
+        pv = tk.Frame(self.tab_cam, bg=BG)
+        pv.pack(fill="both", expand=True)
+        self.cam_canvas = {}
+        for i, (side, title) in enumerate((("local", "LOCAL  (what we send)"),
+                                           ("remote", "RECEIVED  (through the switch)"))):
+            col = tk.Frame(pv, bg=CARD, highlightthickness=1, highlightbackground=GRID)
+            col.grid(row=0, column=i, sticky="nsew", padx=(0, 6) if i == 0 else (6, 0))
+            tk.Label(col, text=title, bg=CARD, fg=ACC if i else MUT,
+                     font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=8, pady=(6, 2))
+            cv = tk.Canvas(col, bg="#0b0d12", highlightthickness=0)
+            cv.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+            cv.bind("<Configure>", lambda e, s=side: self._cam_redraw_idle(s))
+            self.cam_canvas[side] = cv
+        pv.grid_columnconfigure(0, weight=1, uniform="pv")
+        pv.grid_columnconfigure(1, weight=1, uniform="pv")
+        pv.grid_rowconfigure(0, weight=1)
+        self._cam_placeholder("local", "press Start Camera")
+        self._cam_placeholder("remote", "nothing received yet")
+
+        # Import OpenCV off the critical path: deferred so the window paints
+        # first, and so --selftest / --verify never pay for the import at all.
+        self.after(800, self._cam_probe)
+
+    def _cam_probe(self):
+        cv2 = load_cv2()
+        if cv2 is None:
+            self.lbl_cam.configure(
+                text="OpenCV not installed - run:  pip install opencv-python",
+                fg=WARN)
+            self.b_cam_start.configure(state="disabled")
+            self.log("Camera Passthrough disabled: OpenCV (cv2) could not be "
+                     f"imported by {sys.executable} ({CV2_ERR}). Install it with "
+                     "'pip install opencv-python'. Everything else works without "
+                     "it.", WARN)
+        else:
+            self.lbl_cam.configure(
+                text=f"OpenCV {getattr(cv2, '__version__', '?')} ready", fg=MUT)
+
+    def _cam_placeholder(self, side: str, text: str):
+        cv = self.cam_canvas[side]
+        cv.delete("all")
+        # The cached photo image belongs to a canvas item we just deleted, so it
+        # must go too - otherwise _cam_show would take the "reuse" path and move
+        # an item that no longer exists, leaving the pane blank.
+        self._cam_img.pop(side, None)
+        w = cv.winfo_width() or 480
+        h = cv.winfo_height() or 300
+        cv.create_text(w // 2, h // 2, text=text, fill=MUT,
+                       font=("Segoe UI", 9))
+
+    def _cam_redraw_idle(self, side: str):
+        """Canvas resized: re-centre the last frame, or redraw the hint."""
+        cvs = self.cam_canvas[side]
+        if self._cam_img.get(side) is None:
+            self._cam_placeholder(
+                side, "press Start Camera" if side == "local"
+                else "nothing received yet")
+        else:
+            # Keeps a frozen last frame centred after the camera has stopped;
+            # while it is running the next frame would fix this anyway.
+            cvs.coords("frame", max(40, cvs.winfo_width()) // 2,
+                       max(40, cvs.winfo_height()) // 2)
+
+    def cam_start(self):
+        if self.running:
+            messagebox.showinfo("Busy", "A test is running. Stop it first.")
+            return
+        if self.usb_active:
+            messagebox.showinfo("Busy", "The USB capture is running. Stop it first.")
+            return
+        if self.cam_active:
+            return
+        cv2 = load_cv2()
+        if cv2 is None:
+            messagebox.showerror(
+                "OpenCV missing",
+                "The camera passthrough needs OpenCV, which this interpreter "
+                f"cannot import:\n\n  {sys.executable}\n\n"
+                f"  {CV2_ERR}\n\nInstall it with:\n"
+                '  "C:\\Program Files\\Python313\\python.exe" -m pip install '
+                "opencv-python\n\nEverything else in this tool works without it.")
+            return
+        try:
+            # Same adapter validation as every other test - Wi-Fi, virtual,
+            # unplugged, no-link and same-adapter all produce their usual
+            # explanatory error here.
+            self._read_cfg()
+        except Exception as e:
+            messagebox.showerror("Configuration", str(e))
+            return
+
+        c = self.cfg
+        from_a = self.v_cam_from.get().startswith("A")
+        try:
+            w, h = (int(x) for x in self.v_cam_res.get().split("x"))
+        except Exception:
+            w, h = 320, 240
+        link = CameraLink(
+            cv2,
+            iface_tx=c.iface_a if from_a else c.iface_b,
+            iface_rx=c.iface_b if from_a else c.iface_a,
+            mac_src=c.mac_a if from_a else c.mac_b,
+            # Unicast to the RECEIVING adapter: the switch has to have learned
+            # that MAC and forward to the right port, so a picture arriving is
+            # also proof of forwarding rather than flooding.
+            mac_dst=c.mac_b if from_a else c.mac_a,
+            emit=self.emit, dev=int(self.v_cam_dev.get()),
+            width=w, height=h, fps=float(self.v_cam_fps.get()),
+            quality=int(self.v_cam_q.get()))
+
+        self.cam = link
+        self.cam_active = True
+        self._cam_decode_errors = 0
+        self.b_cam_start.configure(state="disabled")
+        self.b_cam_stop.configure(state="normal")
+        for b in (self.b_quick, self.b_load, self.b_full, self.b_cal):
+            b.configure(state="disabled")
+        self.lbl_cam.configure(text="starting...", fg=WARN)
+        self._cam_placeholder("local", "opening camera...")
+        self._cam_placeholder("remote", "waiting for frames...")
+        self.log("=" * 74, MUT)
+        self.log(f"CAMERA PASSTHROUGH: {'A -> B' if from_a else 'B -> A'}   "
+                 f"{w}x{h} @ {self.v_cam_fps.get()} fps  JPEG q"
+                 f"{self.v_cam_q.get()}  EtherType 0x88B6", ACC)
+
+        # Opening the webcam plus the pcap handle takes about 1.5 s. Do it off
+        # the Tk thread so the window never freezes; the worker only emits.
+        def worker():
+            try:
+                link.open()
+                link.start()
+                self.emit("camstate", ("running", ""))
+            except Exception as e:
+                import traceback
+                self.emit("logc", (f"camera passthrough failed: {e}", BAD))
+                self.emit("logc", (traceback.format_exc(), MUT))
+                try:
+                    link.stop()
+                except Exception:
+                    pass
+                self.emit("camstate", ("failed", str(e)))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def cam_stop(self):
+        link = self.cam
+        if link is None:
+            return
+        self.b_cam_stop.configure(state="disabled")
+        self.lbl_cam.configure(text="stopping...", fg=WARN)
+
+        def worker():
+            try:
+                link.stop()
+            except Exception:
+                pass
+            self.emit("camstate", ("stopped", ""))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_camstate(self, payload):
+        state, msg = payload
+        if state == "running":
+            self.lbl_cam.configure(text="running", fg=OK)
+            self.status.configure(text="camera passthrough running")
+            return
+        # stopped or failed
+        self.cam_active = False
+        self.cam = None
+        self._cam_pending.clear()
+        self.b_cam_start.configure(
+            state="normal" if load_cv2() is not None else "disabled")
+        self.b_cam_stop.configure(state="disabled")
+        if not self.running:
+            for b in (self.b_quick, self.b_load, self.b_full, self.b_cal):
+                b.configure(state="normal")
+        if state == "failed":
+            self.lbl_cam.configure(text="failed - see Log tab", fg=BAD)
+            self._cam_placeholder("local", "failed to start")
+        else:
+            self.lbl_cam.configure(text="stopped", fg=MUT)
+            self.status.configure(text="idle")
+            self.log("camera passthrough stopped", MUT)
+
+    def _on_vstats(self, s: Dict) -> None:
+        k = self.cam_kpi
+        k["sent"].set(f"{s['frames_sent']}")
+        k["intact"].set(f"{s['frames_complete']}",
+                        OK if s["frames_complete"] else MUT)
+        inc = s["frames_incomplete"]
+        k["incomp"].set(f"{inc}", OK if inc == 0 else WARN)
+        cm = s["chunks_missing"]
+        k["cmiss"].set(f"{cm}", OK if cm == 0 else WARN)
+        p = s["intact_pct"]
+        k["ipct"].set(f"{p:.1f}", OK if p >= 95 else (WARN if p >= 50 else BAD))
+        k["lat"].set(f"{s['lat_ms']:.1f}" if s["lat_ms"] else "-")
+        k["mbps"].set(f"{s['tx_mbps']:.2f}")
+        # A host capture drop is a PC limit, never a switch fault (invariant 1).
+        hd = s.get("host_drops", 0)
+        k["hdrop"].set(f"{hd}", OK if hd == 0 else WARN)
+
+    def _cam_show(self, side: str, jpeg: bytes) -> None:
+        """
+        JPEG -> BGR -> fit -> PPM -> Tk image. Runs on the Tk main thread, called
+        only from _pump(): worker threads must never touch a widget.
+        """
+        cv2 = load_cv2()
+        if cv2 is None:
+            return
+        cvs = self.cam_canvas[side]
+        try:
+            img = jpeg_to_bgr(cv2, jpeg)
+            if img is None:
+                raise ValueError("imdecode returned None")
+            cw = max(40, cvs.winfo_width())
+            ch = max(40, cvs.winfo_height())
+            sh, sw = img.shape[0], img.shape[1]
+            sc = min(cw / sw, ch / sh)
+            if sc < 0.98 or sc > 1.02:
+                img = cv2.resize(img, (max(1, int(sw * sc)), max(1, int(sh * sc))),
+                                 interpolation=(cv2.INTER_AREA if sc < 1
+                                                else cv2.INTER_LINEAR))
+            ppm = bgr_to_ppm(cv2, img)
+            h, w = img.shape[0], img.shape[1]
+        except Exception:
+            self._cam_decode_errors += 1
+            return
+        # Reuse one photo image per side while the size holds: recreating a Tcl
+        # image 25x/s churns the interpreter for no reason.
+        cur = self._cam_img.get(side)
+        if cur is None or cur.width() != w or cur.height() != h:
+            cur = tk.PhotoImage(master=self, data=ppm)
+            self._cam_img[side] = cur
+            cvs.delete("all")
+            cvs.create_image(cw // 2, ch // 2, image=cur, anchor="center",
+                             tags="frame")
+        else:
+            cur.configure(data=ppm)
+            cvs.coords("frame", cw // 2, ch // 2)
+
+    # ======================================================================
+    # USB HID / hub test view (section 4d)
+    # ======================================================================
+    def _build_usb(self):
+        f = self.frame_usb
+        bar = tk.Frame(f, bg=CARD, highlightthickness=1, highlightbackground=GRID)
+        bar.pack(fill="x", padx=12, pady=(10, 0))
+        g = tk.Frame(bar, bg=CARD)
+        g.pack(fill="x", padx=10, pady=8)
+
+        tk.Label(g, text="HID DEVICE (mouse) TO WATCH", bg=CARD, fg=MUT,
+                 font=("Segoe UI", 7, "bold")).grid(row=0, column=0, sticky="w")
+        self.cb_usb = ttk.Combobox(g, width=62, state="readonly")
+        self.cb_usb.grid(row=1, column=0, padx=(0, 10), sticky="w")
+        self._btn(g, "Refresh", self.usb_refresh, "#2b3242", 9).grid(row=1, column=1,
+                                                                    padx=3)
+        tk.Label(g, text="PHASE (tags the result)", bg=CARD, fg=MUT,
+                 font=("Segoe UI", 7, "bold")).grid(row=0, column=2, sticky="w",
+                                                   padx=(14, 0))
+        self.v_usb_phase = tk.StringVar(value=USB_PHASE_HUB)
+        ttk.Combobox(g, textvariable=self.v_usb_phase, width=24, state="readonly",
+                     values=[USB_PHASE_BASE, USB_PHASE_HUB]).grid(
+            row=1, column=2, sticky="w", padx=(14, 0))
+        self.b_usb_start = self._btn(g, "Start", self.usb_start, "#2ecc71", 10)
+        self.b_usb_start.grid(row=1, column=3, padx=(14, 6))
+        self.b_usb_stop = self._btn(g, "Stop", self.usb_stop, BAD, 9)
+        self.b_usb_stop.grid(row=1, column=4)
+        self.b_usb_stop.configure(state="disabled")
+        self._btn(g, "← Back", self._show_landing, "#2b3242", 8).grid(
+            row=1, column=5, padx=(14, 0))
+        self.lbl_usb = tk.Label(g, text="idle", bg=CARD, fg=MUT,
+                                font=("Segoe UI", 8), anchor="w")
+        self.lbl_usb.grid(row=2, column=0, columnspan=6, sticky="w", pady=(5, 0))
+        g.grid_columnconfigure(0, weight=1)
+
+        hint = tk.Label(
+            f,
+            text="Plug the mouse into the hub's downstream port, run one capture "
+                 "as 'Through Hub', then plug the same mouse straight into the PC "
+                 "and run 'Baseline' - the difference is the hub's contribution. "
+                 "Move and click the mouse continuously during a capture: a mouse "
+                 "only reports while it moves. This measures input timing and "
+                 "connection stability, NOT throughput - a mouse offers a few kB/s, "
+                 "so it can never load a hub. A WIRELESS mouse adds an RF hop of "
+                 "its own jitter between mouse and receiver, on top of the USB "
+                 "link; for the cleanest hub comparison use a wired mouse, or keep "
+                 "the same receiver in both phases so the RF hop cancels out.",
+            bg=BG, fg=MUT, font=("Segoe UI", 8), justify="left",
+            wraplength=1180, anchor="w")
+        hint.pack(fill="x", padx=12, pady=(6, 2))
+        f.bind("<Configure>",
+               lambda e, l=hint: l.configure(wraplength=max(320, e.width - 40)))
+
+        k = tk.Frame(f, bg=BG)
+        k.pack(fill="x", padx=12, pady=(2, 4))
+        self.usb_kpi = {}
+        for key, label, wdt in [
+            ("rps", "Reports/s moving", 138), ("avg", "Avg interval ms", 130),
+            ("jit", "Jitter ms", 104), ("p95", "p95 ms", 96),
+            ("gap", "Longest gap ms", 128), ("rep", "Reports", 104),
+            ("evt", "Disconnects", 112), ("st", "State", 116),
+        ]:
+            w = KPI(k, label, wdt)
+            w.pack(side="left", padx=(0, 8))
+            self.usb_kpi[key] = w
+
+        # The chart strip is created and packed BEFORE the panels above it, and
+        # keeps a reserved height it does not give up. Packed after them it lost
+        # the argument: as soon as the comparison readout filled with both
+        # phases, row 0 grew and shoved the last chart off the bottom edge of the
+        # window. Reserving the strip makes the text panels shrink instead.
+        cw = tk.Frame(f, bg=BG, height=400)
+        cw.pack(side="bottom", fill="x", padx=12, pady=(0, 12))
+        cw.pack_propagate(False)
+
+        body = tk.Frame(f, bg=BG)
+        body.pack(fill="both", expand=True, padx=12, pady=(2, 4))
+
+        left = tk.Frame(body, bg=CARD, highlightthickness=1, highlightbackground=GRID)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        tk.Label(left, text="CONNECTION RELIABILITY  /  TOPOLOGY", bg=CARD, fg=MUT,
+                 font=("Segoe UI", 7, "bold")).pack(anchor="w", padx=8, pady=(6, 2))
+        tk.Label(left, text="PnP status transitions for the mouse and its hub. "
+                            "Steady state logs nothing, so every line here is a "
+                            "real change.",
+                 bg=CARD, fg=MUT, font=("Segoe UI", 7)).pack(anchor="w", padx=8)
+        self.usb_txt = tk.Text(left, bg="#0f1218", fg=FG, relief="flat",
+                               font=("Consolas", 8), wrap="word", height=12)
+        self.usb_txt.pack(fill="both", expand=True, padx=8, pady=(4, 8))
+        for tag, col in (("info", FG), ("mut", MUT), ("ok", OK),
+                         ("bad", BAD), ("warn", WARN)):
+            self.usb_txt.tag_configure(tag, foreground=col)
+
+        right = tk.Frame(body, bg=CARD, highlightthickness=1, highlightbackground=GRID)
+        right.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        tk.Label(right, text="BASELINE  vs  THROUGH HUB", bg=CARD, fg=MUT,
+                 font=("Segoe UI", 7, "bold")).pack(anchor="w", padx=8, pady=(6, 2))
+        tk.Label(right, text="Each capture is stored under its phase when you press "
+                             "Stop, so this panel is the settled end-of-run "
+                             "comparison. The charts below plot the same figures "
+                             "live, both phases on one timeline.",
+                 bg=CARD, fg=MUT, font=("Segoe UI", 7), justify="left",
+                 wraplength=420).pack(anchor="w", padx=8)
+        # THE VERDICT - the one line that answers "is this hub OK?", so the tab
+        # ends in a conclusion rather than a wall of numbers. Same visual
+        # language as PASS / FAIL in the Ethernet Results tab: the reading
+        # itself is coloured OK / WARN / BAD.
+        self.usb_verdict = tk.Label(
+            right, text="no verdict yet - capture a run and press Stop",
+            bg="#0f1218", fg=MUT, font=("Segoe UI", 9, "bold"), justify="left",
+            anchor="w", wraplength=400, padx=8, pady=6)
+        self.usb_verdict.pack(fill="x", padx=8, pady=(6, 0))
+        self.usb_cmp = tk.Label(right, text="no captures yet", bg=CARD, fg=MUT,
+                                font=("Consolas", 9), justify="left", anchor="nw")
+        self.usb_cmp.pack(fill="both", expand=True, padx=8, pady=(6, 8))
+
+        # --- trend charts
+        # The KPI row above is an instantaneous readout and it flickers far too
+        # much to draw a conclusion from. These are the SAME figures over time,
+        # which is what actually lets a phase be judged - the exact relationship
+        # the ETH dashboard already has between its KPI row and its four charts.
+        # The default maxlen 240 x UsbHidLink.TICK_S = ~72 s of history, which
+        # holds BOTH phases of a normal comparison on one timeline. A longer
+        # window was tried and rejected: it right-aligns a typical capture into a
+        # sliver of the plot width and the trend becomes unreadable.
+        self.ch_usb_rate = LineChart(cw, "Report rate (while moving)", "reports/s",
+                                     [("rate", ACC)], height=100)
+        self.ch_usb_iv = LineChart(cw, "Inter-report interval", "ms",
+                                   [("avg", WARN), ("p95", BAD)], height=100)
+        self.ch_usb_jit = LineChart(cw, "Jitter", "ms", [("jitter", WARN)],
+                                    height=78, ymin_span=0.5)
+        self.ch_usb_evt = LineChart(cw, "Reliability events (cumulative)", "count",
+                                    [("events", BAD)], height=78, ymin_span=1.0)
+        for c in (self.ch_usb_rate, self.ch_usb_iv, self.ch_usb_jit, self.ch_usb_evt):
+            c.pack(fill="both", expand=True, pady=3)
+
+        body.grid_columnconfigure(0, weight=3, uniform="ub")
+        body.grid_columnconfigure(1, weight=2, uniform="ub")
+        body.grid_rowconfigure(0, weight=1)
+
+        self.after(400, self.usb_refresh)
+
+    def usb_log(self, msg: str, color: str = FG) -> None:
+        tag = {FG: "info", MUT: "mut", OK: "ok", BAD: "bad",
+               WARN: "warn"}.get(color, "info")
+        ts = datetime.now().strftime("%H:%M:%S")
+        try:
+            self.usb_txt.insert("end", f"[{ts}] {msg}\n", tag)
+            self.usb_txt.see("end")
+        except Exception:
+            pass
+
+    def usb_refresh(self):
+        """Enumerate mice via Raw Input, name them via Get-PnpDevice."""
+        if os.name != "nt":
+            self.cb_usb["values"] = ["<Windows only>"]
+            self.lbl_usb.configure(text="the USB test needs Windows Raw Input",
+                                   fg=WARN)
+            self.b_usb_start.configure(state="disabled")
+            return
+        self.usb_mice = enum_raw_mice()
+        names = pnp_mouse_names()
+        vals = []
+        for m in self.usb_mice:
+            nm = names.get(m["iid"], "") or "HID mouse"
+            vid = f"VID_{m['vid']}&PID_{m['pid']}" if m["vid"] else "unknown VID/PID"
+            tail = m["iid"].split("\\")[-1][:18]
+            m["name"] = nm
+            m["disp"] = f"{nm}  |  {vid}  |  {tail}"
+            vals.append(m["disp"])
+        self.cb_usb["values"] = vals or ["<no mice found>"]
+        if vals and self.cb_usb.get() not in vals:
+            self.cb_usb.set(vals[0])
+        self.b_usb_start.configure(state="normal" if vals else "disabled")
+        self.lbl_usb.configure(
+            text=(f"{len(vals)} mouse device(s) visible to Raw Input. Pick the one "
+                  "plugged into the hub, then press Start."), fg=MUT)
+
+    def _usb_selected(self) -> Optional[Dict]:
+        d = self.cb_usb.get()
+        for m in self.usb_mice:
+            if m.get("disp") == d:
+                return m
+        return None
+
+    def usb_start(self):
+        if self.running:
+            messagebox.showinfo("Busy", "An Ethernet test is running. Stop it first.")
+            return
+        if self.cam_active:
+            messagebox.showinfo("Busy", "The camera passthrough is running. Stop it "
+                                        "first.")
+            return
+        if self.usb_active:
+            return
+        m = self._usb_selected()
+        if m is None:
+            messagebox.showerror("No device", "Pick a mouse first, then press "
+                                             "Refresh if the list is empty.")
+            return
+        phase = self.v_usb_phase.get()
+        link = UsbHidLink(self.emit, handle=m["handle"], path=m["path"],
+                          name=m.get("name") or "mouse", mouse_id=m["iid"],
+                          phase=phase)
+        self.usb = link
+        self.usb_active = True
+        self.b_usb_start.configure(state="disabled")
+        self.b_usb_stop.configure(state="normal")
+        for b in (self.b_quick, self.b_load, self.b_full, self.b_cal):
+            b.configure(state="disabled")
+        self.lbl_usb.configure(text="starting...", fg=WARN)
+        self.usb_log("=" * 60, MUT)
+        self.usb_log(f"START  [{phase}]  {m.get('name')}  "
+                     f"VID_{m['vid']}&PID_{m['pid']}", ACC)
+
+        def worker():
+            # The PnP parent walk shells out to PowerShell (~1 s), so it happens
+            # here rather than on the Tk thread.
+            try:
+                chain = pnp_parent_chain(m["iid"])
+                link.chain = chain
+                for i, d in enumerate(chain):
+                    self.emit("usbevent", {"kind": "info",
+                                           "text": ("  " * i) + "-> "
+                                                   f"{d['name']}  [{d['status']}]"})
+                hub = find_hub_ancestor(chain)
+                if hub:
+                    link.hub_id = (hub.get("id") or "").upper()
+                    link.hub_name = hub.get("name") or "hub"
+                    self.emit("usbevent", {
+                        "kind": "ok",
+                        "text": f"device is behind an EXTERNAL hub: {link.hub_name} "
+                                "- this run exercises the hub"})
+                else:
+                    self.emit("usbevent", {
+                        "kind": "warn",
+                        "text": "no external hub above this device - it is plugged "
+                                "straight into the PC. That is the BASELINE path; "
+                                "check the phase you selected."})
+                link.start()
+            except Exception as e:
+                self.emit("usbevent", {"kind": "error", "text": f"start failed: {e}"})
+                try:
+                    link.stop()
+                except Exception:
+                    pass
+                self.emit("usbstate", ("failed", str(e)))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def usb_stop(self):
+        link = self.usb
+        if link is None:
+            return
+        self.b_usb_stop.configure(state="disabled")
+        self.lbl_usb.configure(text="stopping...", fg=WARN)
+        snap = link.snapshot()
+
+        def worker():
+            try:
+                link.stop()
+            except Exception:
+                pass
+            self.emit("usbstate", ("stopped", ""))
+        threading.Thread(target=worker, daemon=True).start()
+        # Store the capture under its phase so the two paths can be compared.
+        if snap.get("reports", 0) > 0:
+            snap["hub_name"] = link.hub_name
+            self.usb_samples[link.phase] = snap
+            self.usb_log(f"captured [{link.phase}]: {snap['reports']} reports, "
+                         f"avg {snap['avg_ms']:.2f} ms, jitter "
+                         f"{snap['jitter_ms']:.2f} ms, p95 {snap['p95_ms']:.2f} ms",
+                         OK)
+        else:
+            self.usb_log("no reports captured - was the mouse moved? Nothing stored.",
+                         WARN)
+        self._usb_update_compare()
+
+    def _usb_update_compare(self):
+        b = self.usb_samples.get(USB_PHASE_BASE)
+        h = self.usb_samples.get(USB_PHASE_HUB)
+        lines = []
+        # Compact, and deltas FIRST. This panel shares its height with the
+        # reserved chart strip below it, so the tail of a long readout is simply
+        # not on screen - which is where the deltas used to sit, one figure per
+        # line. They are the numbers the verdict above is drawn from, so they go
+        # at the top and the per-phase detail takes the risk of being cut.
+        # No conclusion is written here any more: these numbers are the
+        # evidence, and usb_verdict() turns them into the single coloured
+        # verdict line above. Two sentences judging the same figures on
+        # different thresholds could disagree with each other.
+        if b and h:
+            d_avg = h["avg_ms"] - b["avg_ms"]
+            d_jit = h["jitter_ms"] - b["jitter_ms"]
+            d_p95 = h["p95_ms"] - b["p95_ms"]
+            lines.append("hub - baseline")
+            lines.append(f"  avg {d_avg:+.2f}   jitter {d_jit:+.2f}   "
+                         f"p95 {d_p95:+.2f} ms")
+            lines.append("")
+        for tag, s in ((USB_PHASE_BASE, b), (USB_PHASE_HUB, h)):
+            if s is None:
+                lines.append(f"{tag:<23} (not captured yet)")
+                continue
+            lines.append(f"{tag:<23} n={s['reports']}")
+            lines.append(f"  avg {s['avg_ms']:6.2f}  jit {s['jitter_ms']:5.2f}  "
+                         f"p95 {s['p95_ms']:6.2f}  p99 {s['p99_ms']:6.2f} ms")
+            lines.append(f"  max gap {s['max_gap_ms']:6.1f} ms   "
+                         f"faults {s['faults']}")
+        self.usb_cmp.configure(text="\n".join(lines))
+        self._usb_set_verdict()
+
+    def _usb_set_verdict(self, live_faults: int = 0, live_phase: str = "") -> None:
+        """Draw the conclusion drawn from the stored captures (section 4d)."""
+        txt, level = usb_verdict(self.usb_samples.get(USB_PHASE_BASE),
+                                 self.usb_samples.get(USB_PHASE_HUB),
+                                 live_faults, live_phase)
+        self.usb_verdict.configure(
+            text=txt, fg={"ok": OK, "warn": WARN, "bad": BAD, "mut": MUT}[level])
+
+    def _on_usbstats(self, s: Dict) -> None:
+        k = self.usb_kpi
+        k["rps"].set(f"{s['rps_moving']:.0f}" if s["rps_moving"] else "-")
+        k["avg"].set(f"{s['avg_ms']:.2f}" if s["avg_ms"] else "-")
+        jit = s["jitter_ms"]
+        k["jit"].set(f"{jit:.2f}" if jit else "-",
+                     OK if jit < 4 else (WARN if jit < 15 else BAD))
+        k["p95"].set(f"{s['p95_ms']:.2f}" if s["p95_ms"] else "-")
+        gap = s["max_gap_ms"]
+        k["gap"].set(f"{gap:.1f}" if gap else "-",
+                     OK if gap < 60 else (WARN if gap < 150 else BAD))
+        k["rep"].set(f"{s['reports']}")
+        f = s["faults"]
+        k["evt"].set(f"{f}", OK if f == 0 else BAD)
+        k["st"].set(s["status"], OK if s["status"] == "capturing" else MUT)
+        # A disconnect is the strongest signal this tab produces, so it reaches
+        # the verdict immediately instead of waiting for Stop. The TIMING half
+        # of the verdict still comes only from stored, settled captures, so the
+        # line does not flicker with the KPI row above it.
+        self._usb_set_verdict(f, s.get("phase", "") or "")
+        # Trend charts, fed at the same ~0.3 s cadence the stats arrive on. The
+        # charts are deliberately NOT cleared between runs: the phase divider
+        # separates Baseline from Through Hub on ONE timeline, so the two paths
+        # can be compared by eye - the chart twin of the BASELINE vs THROUGH HUB
+        # readout, which tags its captures the same way.
+        ph = (s.get("phase", "") or "").split(" - ")[0]
+        # Before the first in-motion interval, avg / jitter / p95 are simply not
+        # defined yet. Storing them as 0 would draw a dive to the axis that reads
+        # as a device fault; a gap is the truth. Same reasoning as the idle gaps
+        # on the Ethernet charts.
+        idle = s.get("intervals", 0) <= 0
+        self.ch_usb_rate.push({"rate": s["rps_moving"]}, idle, ph)
+        self.ch_usb_iv.push({"avg": s["avg_ms"], "p95": s["p95_ms"]}, idle, ph)
+        self.ch_usb_jit.push({"jitter": jit}, idle, ph)
+        # Never idle: a disconnect is real even while the mouse sits still, and
+        # here a flat zero is the reading that matters most.
+        self.ch_usb_evt.push({"events": f + s["recoveries"]}, False, ph)
+
+    def _on_usbevent(self, ev: Dict) -> None:
+        kind = ev.get("kind", "info")
+        if kind in ("info", "ok", "warn", "error"):
+            col = {"info": MUT, "ok": OK, "warn": WARN, "error": BAD}[kind]
+            self.usb_log(ev.get("text", ""), col)
+            return
+        # PnP transition
+        who = ev.get("name") or ev.get("id", "")
+        if kind == "fault":
+            self.usb_log(f"FAULT  {who}: {ev.get('from')} -> {ev.get('to')}"
+                         + (f"  problem={ev['problem']}" if ev.get("problem") else ""),
+                         BAD)
+        else:
+            self.usb_log(f"RECOVERED  {who}: {ev.get('from')} -> {ev.get('to')}", OK)
+
+    def _on_usbstate(self, payload) -> None:
+        state, msg = payload
+        if state == "running":
+            self.lbl_usb.configure(text="capturing - move and click the mouse", fg=OK)
+            return
+        self.usb_active = False
+        self.usb = None
+        self.b_usb_start.configure(state="normal" if self.usb_mice else "disabled")
+        self.b_usb_stop.configure(state="disabled")
+        if not self.running:
+            for b in (self.b_quick, self.b_load, self.b_full, self.b_cal):
+                b.configure(state="normal")
+        # The last stats snapshot in flight still said "capturing", so the State
+        # KPI has to be corrected here or it lies about a finished run.
+        if state == "failed":
+            self.lbl_usb.configure(text=f"failed: {msg}"[:90], fg=BAD)
+            self.usb_kpi["st"].set("failed", BAD)
+        else:
+            self.lbl_usb.configure(text="stopped", fg=MUT)
+            self.usb_kpi["st"].set("stopped", MUT)
 
     # ---- console -------------------------------------------------------
     def _build_console(self):
@@ -3281,6 +5395,7 @@ class App(tk.Tk):
 
     def _pump(self) -> None:
         redraw = False
+        usb_redraw = False
         try:
             for _ in range(400):
                 kind, payload = self.q.get_nowait()
@@ -3302,6 +5417,22 @@ class App(tk.Tk):
                     self._on_row(payload)  # type: ignore
                 elif kind == "console":
                     self._on_console(payload)  # type: ignore
+                elif kind == "video":
+                    # Keep only the NEWEST frame per side. Rendering a backlog
+                    # would show the past and make the switch look slow.
+                    side, jpeg, _lat = payload  # type: ignore
+                    self._cam_pending[side] = jpeg
+                elif kind == "vstats":
+                    self._on_vstats(payload)  # type: ignore
+                elif kind == "camstate":
+                    self._on_camstate(payload)
+                elif kind == "usbstats":
+                    self._on_usbstats(payload)  # type: ignore
+                    usb_redraw = True
+                elif kind == "usbevent":
+                    self._on_usbevent(payload)  # type: ignore
+                elif kind == "usbstate":
+                    self._on_usbstate(payload)
                 elif kind == "done":
                     self._on_done(str(payload))
         except queue.Empty:
@@ -3309,7 +5440,19 @@ class App(tk.Tk):
         if redraw:
             for c in (self.ch_tp, self.ch_pps, self.ch_loss, self.ch_lat):
                 c.redraw()
-        self.after(120, self._pump)
+        if usb_redraw:
+            for c in (self.ch_usb_rate, self.ch_usb_iv, self.ch_usb_jit,
+                      self.ch_usb_evt):
+                c.redraw()
+        if self._cam_pending:
+            # JPEG decode -> Tk image happens HERE, on the Tk main thread.
+            for side, jpeg in list(self._cam_pending.items()):
+                self._cam_show(side, jpeg)
+            self._cam_pending.clear()
+        # The 120 ms tick would cap the video at ~8 fps and make the switch look
+        # laggy, so the pump runs faster WHILE the camera is active only. The
+        # charts still redraw only when a sample actually arrives.
+        self.after(40 if self.cam_active else 120, self._pump)
 
     def _on_sample(self, s: Dict) -> None:
         k = self.kpi
@@ -3392,6 +5535,20 @@ class App(tk.Tk):
     def _start(self, fn, label: str):
         if self.running:
             messagebox.showinfo("Busy", "A test is already running.")
+            return
+        if self.cam_active:
+            messagebox.showinfo(
+                "Camera passthrough is running",
+                "The camera passthrough owns both adapters right now. Press "
+                "Stop Camera on the Camera Passthrough tab first - otherwise "
+                "its video would share the link with the measurement and "
+                "distort the result.")
+            return
+        if self.usb_active:
+            messagebox.showinfo(
+                "USB test is running",
+                "Stop the USB capture first. Only one test runs at a time, so "
+                "the two can never be confused for one another.")
             return
         if not SCAPY_OK:
             messagebox.showerror(
@@ -3695,6 +5852,20 @@ class App(tk.Tk):
 
     def _on_close(self):
         try:
+            if self.usb is not None:
+                self.usb.stop()   # unregisters raw input, kills the msg window
+                self.usb = None
+                self.usb_active = False
+        except Exception:
+            pass
+        try:
+            if self.cam is not None:
+                self.cam.stop()      # releases the webcam and the pcap handle
+                self.cam = None
+                self.cam_active = False
+        except Exception:
+            pass
+        try:
             if self.session:
                 self.session.stop_event.set()
                 time.sleep(0.3)
@@ -3958,6 +6129,213 @@ def selftest() -> None:
     assert abs(line_rate_pps(64, 1000) - 1_488_095.238) < 1.0
     assert abs(line_rate_pps(1518, 1000) - 81_274.1) < 1.0
     assert abs(line_rate_pps(64, 100) - 148_809.5) < 1.0
+    print("OK")
+
+    print("camera chunk codec ...", end=" ")
+    DST, SRC = "aa:bb:cc:dd:ee:ff", "11:22:33:44:55:66"
+    for nbytes in (5_000, 40_000):
+        blob = bytes((i * 13 + 7) & 0xFF for i in range(nbytes))
+        chunks = build_video_chunks(DST, SRC, 42, blob, 111)
+        # every chunk must be a legal Ethernet frame the KSZ8895 will forward
+        for c in chunks:
+            assert MIN_FRAME <= len(c) + FCS_LEN <= MAX_FRAME, len(c)
+        asm = VideoAssembler()
+        out = None
+        for c in chunks:
+            out = asm.add(c, 999) or out
+        assert out is not None and out[0] == blob, nbytes
+        assert out[1] == 111, out[1]
+        assert asm.frames_complete == 1 and asm.frames_incomplete == 0
+        assert asm.chunks_missing == 0, asm.stats()
+    # single-chunk image: padded to the 64 B minimum, payload_len still exact
+    tiny = b"\xff\xd8tiny"
+    one = build_video_chunks(DST, SRC, 1, tiny, 7)
+    assert len(one) == 1 and len(one[0]) == MIN_FRAME - FCS_LEN, len(one[0])
+    a1 = VideoAssembler()
+    r1 = a1.add(one[0], 1)
+    assert r1 is not None and r1[0] == tiny, r1
+    print("OK")
+
+    print("camera incomplete-frame handling ...", end=" ")
+    blob = bytes((i * 3 + 1) & 0xFF for i in range(9_000))
+    c_old = build_video_chunks(DST, SRC, 100, blob, 1)
+    c_new = build_video_chunks(DST, SRC, 101, blob, 2)
+    assert len(c_old) > 2
+    asm = VideoAssembler()
+    # withhold one chunk: the frame must NOT be shown, and must NOT yet be
+    # judged either - its chunks could still be on the wire (invariant 2 twin)
+    for c in c_old[:-1]:
+        assert asm.add(c, 1) is None
+    assert asm.frames_incomplete == 0, "judged a frame still in flight"
+    # a newer complete frame retires it, and only now is it counted lost
+    got = None
+    for c in c_new:
+        got = asm.add(c, 2) or got
+    assert got is not None and got[0] == blob
+    assert asm.frames_complete == 1, asm.stats()
+    assert asm.frames_incomplete == 1, asm.stats()
+    assert asm.chunks_missing == 1, asm.stats()
+    # the late/duplicate chunk of a retired frame must not resurrect it
+    assert asm.add(c_old[-1], 3) is None
+    assert asm.chunks_late == 1, asm.stats()
+    assert asm.frames_complete == 1, asm.stats()
+    # duplicates of a pending frame are counted, not mistaken for progress
+    asm2 = VideoAssembler()
+    asm2.add(c_new[0], 1)
+    asm2.add(c_new[0], 1)
+    assert asm2.chunks_dup == 1 and asm2.frames_complete == 0, asm2.stats()
+    assert _fid_newer(1, 65530) and not _fid_newer(65530, 1)
+    assert _fid_newer(2, 1) and not _fid_newer(1, 2)
+    print("OK")
+
+    print("camera / measurement channel isolation ...", end=" ")
+    # 0x88B5 and 0x88B6 must never be able to alias each other
+    vid = build_video_chunks(DST, SRC, 5, b"\xff\xd8" + b"x" * 200, 9)[0]
+    assert parse(vid) is None, "measurement parser accepted a video chunk"
+    meas = bytes(build_template(DST, SRC, 512, 1))
+    assert parse_video_chunk(meas) is None, "video parser accepted a test frame"
+    assert VideoAssembler().add(meas, 1) is None
+    # a chunk truncated by too small a snaplen must be rejected, not decoded
+    assert parse_video_chunk(vid[:40]) is None
+    print("OK")
+
+    print("usb raw-input codec ...", end=" ")
+    # Build a RAWINPUT buffer by hand from the documented Win32 offsets, so this
+    # genuinely cross-checks the ctypes layout instead of comparing it to itself.
+    ptr = ctypes.sizeof(ctypes.c_void_p)
+    hdr = struct.pack("=II", RIM_TYPEMOUSE, 24 + 24)
+    hdr += (struct.pack("=Q", 0xABCD1234) if ptr == 8 else struct.pack("=I", 0xABCD1234))
+    hdr += bytes(ptr)                                  # wParam
+    body = struct.pack("=HHHHIiiI",
+                       0,          # usFlags
+                       0,          # 2 bytes of union padding
+                       0x0004,     # usButtonFlags = RI_MOUSE_RIGHT_BUTTON_DOWN
+                       0,          # usButtonData
+                       0,          # ulRawButtons
+                       -7,         # lLastX
+                       13,         # lLastY
+                       0)          # ulExtraInformation
+    d = parse_rawinput_mouse(hdr + body)
+    assert d is not None, "mouse report rejected"
+    assert d["hDevice"] == 0xABCD1234, hex(d["hDevice"])
+    assert d["buttons"] == 0x0004, d
+    assert d["dx"] == -7 and d["dy"] == 13, d
+    assert d["wheel"] == 0, d
+    # negative wheel delta must come back signed, not as 65516
+    body_w = struct.pack("=HHHHIiiI", 0, 0, RI_MOUSE_WHEEL, 0xFFEC, 0, 0, 0, 0)
+    dw = parse_rawinput_mouse(hdr + body_w)
+    assert dw["wheel"] == -20, dw
+    # a keyboard report and a short buffer must both be refused
+    kb = struct.pack("=II", 1, 24) + bytes(ptr) + bytes(ptr) + bytes(24)
+    assert parse_rawinput_mouse(kb) is None
+    assert parse_rawinput_mouse(b"\x00" * 8) is None
+    # VID/PID must be readable from BOTH the USB and the Bluetooth path form
+    assert _id_field(r"\\?\HID#VID_046D&PID_C548&MI_01#8&3", "VID") == "046D"
+    assert _id_field(r"\\?\HID#VID_046D&PID_C548&MI_01#8&3", "PID") == "C548"
+    assert _id_field(r"HID#{0000}_Dev_VID&02046d_PID&b042_REV&0019", "VID") == "046D"
+    assert _id_field(r"HID#{0000}_Dev_VID&02046d_PID&b042_REV&0019", "PID") == "B042"
+    assert _id_field(r"\\?\HID#ASUF1415&Col01#5&1755cc78", "VID") == ""
+    # Raw Input device path -> PnP InstanceId (how the two APIs are joined)
+    assert (rawinput_path_to_instance_id(
+        r"\\?\HID#VID_046D&PID_C548&MI_01&Col01#8&3837cee4&0&0000#{378de44c}")
+        == r"HID\VID_046D&PID_C548&MI_01&COL01\8&3837CEE4&0&0000")
+    print("OK")
+
+    print("usb interval stats ...", end=" ")
+    st = IntervalStats()
+    base = 100.0
+    # 10 reports at exactly 8 ms (a 125 Hz mouse)
+    for i in range(11):
+        st.add(base + i * 0.008, 1, 0, 0, 0)
+    s = st.snapshot()
+    assert s["reports"] == 11, s
+    assert s["intervals"] == 10, s
+    assert abs(s["avg_ms"] - 8.0) < 1e-6, s
+    assert abs(s["rps_moving"] - 125.0) < 1e-6, s
+    assert abs(s["p50_ms"] - 8.0) < 1e-6 and abs(s["p95_ms"] - 8.0) < 1e-6, s
+    assert s["jitter_ms"] < 1e-9, s          # perfectly periodic -> no jitter
+    assert s["pauses"] == 0, s
+    # A long silence is the user letting go of the mouse, NOT a dropout: it must
+    # be counted as a pause and kept out of avg / jitter / percentiles / max-gap.
+    st.add(base + 5.0, 1, 0, 0, 0)
+    s2 = st.snapshot()
+    assert s2["pauses"] == 1, s2
+    assert abs(s2["avg_ms"] - 8.0) < 1e-6, "an idle gap polluted the average"
+    assert abs(s2["max_gap_ms"] - 8.0) < 1e-6, "an idle gap became a longest gap"
+    # a real in-motion hiccup DOES count
+    st.add(base + 5.0 + 0.040, 1, 0, 0, 0)
+    s3 = st.snapshot()
+    assert abs(s3["max_gap_ms"] - 40.0) < 1e-6, s3
+    assert s3["jitter_ms"] > 0, s3
+    st2 = IntervalStats()
+    for i, ms in enumerate((5, 10, 15, 20, 100)):
+        st2.add(base + ms / 1000.0, 0, 0, 0x0001, 0)
+    s4 = st2.snapshot()
+    assert s4["buttons"] == 5 and s4["moves"] == 0, s4
+    assert abs(s4["max_gap_ms"] - 80.0) < 1e-6, s4
+    print("OK")
+
+    print("usb pnp transition detector ...", end=" ")
+    M, H = "HID\\MOUSE", "USB\\HUB"
+    ok = {M: {"status": "OK"}, H: {"status": "OK"}}
+    # first snapshot has no predecessor: a healthy tree must report nothing
+    assert pnp_diff({}, ok) == []
+    assert pnp_diff(ok, ok) == []
+    err = {M: {"status": "Error", "problem": "CM_PROB_FAILED_POST_START"},
+           H: {"status": "OK"}}
+    ev = pnp_diff(ok, err)
+    assert len(ev) == 1 and ev[0]["kind"] == "fault", ev
+    assert ev[0]["from"] == "OK" and ev[0]["to"] == "ERROR", ev
+    ev2 = pnp_diff(err, ok)
+    assert len(ev2) == 1 and ev2[0]["kind"] == "recovered", ev2
+    # an unplug makes the device vanish from the query entirely
+    ev3 = pnp_diff(ok, {H: {"status": "OK"}})
+    assert len(ev3) == 1 and ev3[0]["kind"] == "fault" and ev3[0]["to"] == "GONE", ev3
+    # full OK -> OK -> Error -> OK walk: exactly one fault, one recovery
+    faults = recov = 0
+    prev: Dict[str, Dict] = {}
+    for snap in (ok, ok, err, ok):
+        for e in pnp_diff(prev, snap):
+            if e["kind"] == "fault":
+                faults += 1
+            else:
+                recov += 1
+        prev = snap
+    assert (faults, recov) == (1, 1), (faults, recov)
+    # a device that is already unhealthy on the first poll is still reported
+    assert len(pnp_diff({}, err)) == 1
+    # hub detection must ignore the host controller's own root hub
+    chain = [{"name": "HID-compliant mouse", "id": "a", "status": "OK"},
+             {"name": "USB Input Device", "id": "b", "status": "OK"},
+             {"name": "Generic USB Hub", "id": "c", "status": "OK"},
+             {"name": "USB Root Hub (USB 3.0)", "id": "d", "status": "OK"}]
+    assert find_hub_ancestor(chain)["id"] == "c"
+    assert find_hub_ancestor([chain[0], chain[3]]) is None, "root hub is not the DUT"
+    print("OK")
+
+    print("usb verdict ...", end=" ")
+
+    def _cap(avg, jit, faults=0, reports=1000):
+        return {"avg_ms": avg, "jitter_ms": jit, "faults": faults,
+                "reports": reports}
+    assert usb_verdict(None, None)[1] == "mut"
+    # one phase only: still a conclusion, never a blank panel
+    t, lv = usb_verdict(_cap(8.0, 3.0), None)
+    assert lv == "ok" and "1000 reports" in t, (t, lv)
+    # a fault outranks every timing number, even a perfect one
+    t, lv = usb_verdict(_cap(8.0, 3.0), _cap(8.0, 3.0, faults=2))
+    assert lv == "bad" and "2 disconnect" in t, (t, lv)
+    # ...including one seen live, before any capture has been stored
+    assert usb_verdict(None, None, 1, USB_PHASE_HUB)[1] == "bad"
+    # a hub that changes nothing passes
+    assert usb_verdict(_cap(8.0, 3.0), _cap(8.2, 3.4))[1] == "ok"
+    # clearly elevated with no fault -> warn, and the deltas must be quoted
+    t, lv = usb_verdict(_cap(8.0, 3.0), _cap(14.0, 9.0))
+    assert lv == "warn" and "+6.00" in t, (t, lv)
+    # the relative arm keeps a slow device from failing on the absolute margin
+    assert usb_verdict(_cap(60.0, 20.0), _cap(70.0, 24.0))[1] == "ok"
+    # a hub that is FASTER than baseline is still just "no meaningful change"
+    assert usb_verdict(_cap(8.0, 3.0), _cap(7.8, 2.6))[1] == "ok"
     print("OK")
 
     print("report render ...", end=" ")

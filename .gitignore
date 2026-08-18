@@ -5,3 +5,12 @@ npcap-*.exe
 switch_test_*.html
 switch_test_*.csv
 switch_test_*.json
+
+# Microsoft Office lock files (appear while a doc is open)
+~$*
+
+# Claude Code per-machine settings (settings.json IS shared, .local.json is not)
+.claude/settings.local.json
+
+# generated test reports
+docs/*.tmp
